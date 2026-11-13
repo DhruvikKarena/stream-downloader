@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Stream Video Downloader - Icon Generator</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0d0d1a;
+      color: #e0e0e0;
+      padding: 40px;
+    }
+    h1 { color: #4CAF50; margin-bottom: 10px; }
+    p.subtitle { color: #888; margin-bottom: 30px; }
+    .icon-row {
+      display: flex;
+      gap: 40px;
+      flex-wrap: wrap;
+      align-items: flex-end;
+    }
+    .icon-card {
+      background: #1a1a2e;
+      border-radius: 12px;
+      padding: 24px;
+      text-align: center;
+      border: 1px solid #2a2a4a;
+    }
+    .icon-card canvas {
+      display: block;
+      margin: 0 auto 16px;
+      image-rendering: pixelated;
+    }
+    .icon-card .label {
+      font-size: 14px;
+      color: #aaa;
+      margin-bottom: 12px;
+    }
+    .icon-card a {
+      display: inline-block;
+      padding: 8px 18px;
+      background: #4CAF50;
+      color: #fff;
+      text-decoration: none;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      transition: background 0.2s;
+    }
+    .icon-card a:hover { background: #388E3C; }
+    .preview-large {
+      margin-top: 40px;
+      background: #1a1a2e;
+      border-radius: 12px;
+      padding: 24px;
+      border: 1px solid #2a2a4a;
+    }
+    .preview-large h2 { color: #4CAF50; margin-bottom: 16px; font-size: 18px; }
+    .preview-row { display: flex; gap: 24px; align-items: center; }
+    .preview-row canvas {
+      border: 1px solid #333;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Stream Video Downloader — Icon Generator</h1>
+  <p class="subtitle">Click "Download PNG" to save each icon. All icons are drawn on canvas and exported as PNG.</p>
+
+  <div class="icon-row" id="iconRow"></div>
+
+  <div class="preview-large">
+    <h2>Scaled Previews (4x)</h2>
+    <div class="preview-row" id="previewRow"></div>
+  </div>
+
+  <script>
+    const SIZES = [16, 32, 48, 128];
+    const BG_COLOR = '#1a1a2e';
+    const GREEN = '#4CAF50';
+    const GREEN_DARK = '#388E3C';
+    const GREEN_LIGHT = '#66BB6A';
+
+    function drawIcon(ctx, size) {
+      const s = size;
+      const r = s * 0.15; // corner radius
+
+      // --- Rounded rectangle background ---
+      ctx.beginPath();
+      ctx.moveTo(r, 0);
+      ctx.lineTo(s - r, 0);
+      ctx.quadraticCurveTo(s, 0, s, r);
+      ctx.lineTo(s, s - r);
+      ctx.quadraticCurveTo(s, s, s - r, s);
+      ctx.lineTo(r, s);
+      ctx.quadraticCurveTo(0, s, 0, s - r);
+      ctx.lineTo(0, r);
+      ctx.quadraticCurveTo(0, 0, r, 0);
+      ctx.closePath();
+
+      // Gradient background for larger sizes
+      if (size >= 48) {
+        const grad = ctx.createLinearGradient(0, 0, 0, s);
+        grad.addColorStop(0, '#22223a');
+        grad.addColorStop(1, '#12121f');
+        ctx.fillStyle = grad;
+      } else {
+        ctx.fillStyle = BG_COLOR;
+      }
+      ctx.fill();
+
+      // Subtle border for larger icons
+      if (size >= 48) {
+        ctx.strokeStyle = '#2a2a4a';
+        ctx.lineWidth = Math.max(1, s * 0.015);
+        ctx.stroke();
+      }
+
+      // --- Draw download arrow ---
+      const cx = s / 2;
+      const arrowWidth = s * 0.32;
+      const stemWidth = s * 0.14;
+      const arrowTop = s * 0.18;
+      const arrowMid = s * 0.48;  // where the stem ends and chevron starts
+      const arrowBottom = s * 0.66;
+
+      // Arrow gradient for 128px
+      if (size >= 128) {
+        const arrowGrad = ctx.createLinearGradient(0, arrowTop, 0, arrowBottom);
+        arrowGrad.addColorStop(0, GREEN_LIGHT);
+        arrowGrad.addColorStop(1, GREEN);
+        ctx.fillStyle = arrowGrad;
+      } else {
+        ctx.fillStyle = GREEN;
+      }
+
+      // Draw arrow as a single path: stem + chevron
+      ctx.beginPath();
+      // Stem top-left
+      ctx.moveTo(cx - stemWidth / 2, arrowTop);
+      // Stem top-right
+      ctx.lineTo(cx + stemWidth / 2, arrowTop);
+      // Stem bottom-right (meets chevron)
+      ctx.lineTo(cx + stemWidth / 2, arrowMid);
+      // Chevron right wing
+      ctx.lineTo(cx + arrowWidth, arrowMid);
+      // Chevron tip (bottom center)
+      ctx.lineTo(cx, arrowBottom);
+      // Chevron left wing
+      ctx.lineTo(cx - arrowWidth, arrowMid);
+      // Back to stem bottom-left
+      ctx.lineTo(cx - stemWidth / 2, arrowMid);
+      ctx.closePath();
+      ctx.fill();
+
+      // Shadow under arrow for large icons
+      if (size >= 128) {
+        ctx.save();
+        ctx.shadowColor = 'rgba(76, 175, 80, 0.3)';
+        ctx.shadowBlur = s * 0.08;
+        ctx.shadowOffsetY = s * 0.02;
+        ctx.fill();
+        ctx.restore();
+      }
+
+      // --- Small play triangle (integrated into the arrow stem) ---
+      const playSize = s * 0.08;
+      const playCx = cx;
+      const playCy = arrowTop + (arrowMid - arrowTop) * 0.45;
+
+      ctx.fillStyle = BG_COLOR;
+      ctx.beginPath();
+      ctx.moveTo(playCx - playSize * 0.4, playCy - playSize * 0.55);
+      ctx.lineTo(playCx - playSize * 0.4, playCy + playSize * 0.55);
+      ctx.lineTo(playCx + playSize * 0.6, playCy);
+      ctx.closePath();
+      ctx.fill();
+
+      // --- Tray / base line ---
+      const trayY = s * 0.78;
+      const trayWidth = s * 0.52;
+      const trayThickness = Math.max(1.5, s * 0.045);
+      const trayCorner = s * 0.04;
+      const trayDepth = s * 0.08;
+
+      ctx.strokeStyle = GREEN;
+      ctx.lineWidth = trayThickness;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+
+      // Draw U-shaped tray
+      ctx.beginPath();
+      ctx.moveTo(cx - trayWidth / 2, trayY);
+      ctx.lineTo(cx - trayWidth / 2, trayY + trayDepth - trayCorner);
+      ctx.quadraticCurveTo(cx - trayWidth / 2, trayY + trayDepth, cx - trayWidth / 2 + trayCorner, trayY + trayDepth);
+      ctx.lineTo(cx + trayWidth / 2 - trayCorner, trayY + trayDepth);
+      ctx.quadraticCurveTo(cx + trayWidth / 2, trayY + trayDepth, cx + trayWidth / 2, trayY + trayDepth - trayCorner);
+      ctx.lineTo(cx + trayWidth / 2, trayY);
+      ctx.stroke();
+    }
+
+    const iconRow = document.getElementById('iconRow');
+    const previewRow = document.getElementById('previewRow');
+
+    SIZES.forEach(size => {
+      // Create actual-size canvas
+      const canvas = document.createElement('canvas');
+      canvas.width = size;
+      canvas.height = size;
+      const ctx = canvas.getContext('2d');
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      drawIcon(ctx, size);
+
+      // Create download link
+      const link = document.createElement('a');
+      link.download = `icon${size}.png`;
+      link.href = canvas.toDataURL('image/png');
+      link.textContent = `Download PNG`;
+
+      // Card
+      const card = document.createElement('div');
+      card.className = 'icon-card';
+      const label = document.createElement('div');
+      label.className = 'label';
+      label.textContent = `${size}×${size}`;
+
+      // Show a scaled-up version for small icons
+      const displayCanvas = document.createElement('canvas');
+      const scale = size < 64 ? Math.floor(128 / size) : 1;
+      displayCanvas.width = size * scale;
+      displayCanvas.height = size * scale;
+      displayCanvas.style.width = `${size * scale}px`;
+      displayCanvas.style.height = `${size * scale}px`;
+      const dCtx = displayCanvas.getContext('2d');
+      dCtx.imageSmoothingEnabled = false;
+      dCtx.drawImage(canvas, 0, 0, size * scale, size * scale);
+
+      card.appendChild(displayCanvas);
+      card.appendChild(label);
+      card.appendChild(link);
+      iconRow.appendChild(card);
+
+      // Preview at 4x (native)
+      const previewCanvas = document.createElement('canvas');
+      const ps = Math.min(size, 128);
+      previewCanvas.width = ps;
+      previewCanvas.height = ps;
+      previewCanvas.style.width = `${ps}px`;
+      previewCanvas.style.height = `${ps}px`;
+      const pCtx = previewCanvas.getContext('2d');
+      pCtx.imageSmoothingEnabled = true;
+      pCtx.drawImage(canvas, 0, 0, ps, ps);
+      previewRow.appendChild(previewCanvas);
+    });
+  </script>
+</body>
+</html>
