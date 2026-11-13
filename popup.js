@@ -11,6 +11,17 @@
   const openDownloaderBtn = document.getElementById('open-downloader-btn');
   const settingsBtn = document.getElementById('settings-btn');
 
+  // Helper DOM references
+  const helperDot = document.getElementById('helper-status-dot');
+  const helperText = document.getElementById('helper-status-text');
+  const checkHelperBtn = document.getElementById('check-helper-btn');
+  const helperGuideBanner = document.getElementById('helper-guide-banner');
+  const closeHelperGuide = document.getElementById('close-helper-guide');
+  const extIdDisplay = document.getElementById('ext-id-display');
+  const copyExtIdBtn = document.getElementById('copy-ext-id-btn');
+
+  let helperState = { checked: false, installed: false, data: null };
+
   // Track active downloads keyed by URL so we can update progress
   const activeDownloads = new Map();
 
@@ -74,7 +85,7 @@
     if (type === 'hls' || type === 'm3u8') return 'HLS STREAM';
     if (type === 'dash' || type === 'mpd') return 'DASH STREAM';
     if (type === 'video') {
-      if (isYt || !hasAudio) return 'VIDEO + AUDIO (RECORDER)';
+      if (isYt || !hasAudio) return 'VIDEO STREAM';
       return hasAudio ? 'VIDEO + AUDIO' : 'VIDEO ONLY';
     }
     if (type === 'audio') return 'AUDIO ONLY';
@@ -149,6 +160,14 @@
       }
       detailsHTML += `<span class="media-url" title="${escapeHtml(item.url)}">${escapeHtml(truncateUrl(item.url))}</span>`;
 
+      if (item.referer) {
+        detailsHTML += '<span class="detail-separator"></span>';
+        detailsHTML += `<span class="media-url" style="color:#81c784;" title="Page / Player Referer: ${escapeHtml(item.referer)}">Ref: ${escapeHtml(truncateUrl(item.referer))}</span>`;
+      }
+
+      const type = (item.type || '').toLowerCase();
+      const isDash = type === 'dash' || type === 'mpd';
+
       card.innerHTML = `
         <div class="media-card-top">
           ${getMediaTypeBadge(item)}
@@ -157,16 +176,18 @@
             <div class="media-details">${detailsHTML}</div>
           </div>
           <div class="media-card-actions">
-            <button class="download-btn" data-index="${index}">
+            <button class="native-dl-btn" data-index="${index}" title="Download via Native Helper (yt-dlp + ffmpeg to ~/Downloads)">
+              ⚡ Native
+            </button>
+            <button class="download-btn browser-dl-btn" data-index="${index}" ${isDash ? 'disabled style="opacity:0.4; cursor:not-allowed;" title="DASH (.mpd) requires Native Helper (yt-dlp + ffmpeg)"' : 'title="Download via In-Browser Downloader (parallel segments, AES-128, disk streaming)"'}>
               ${createSvg('download')}
-              <span>Download</span>
+              <span>${isDash ? 'N/A' : 'Browser'}</span>
             </button>
           </div>
         </div>
       `;
 
-      // Quality selector for HLS
-      const type = (item.type || '').toLowerCase();
+      // Quality selector for HLS / DASH
       if (type === 'hls' || type === 'm3u8') {
         const qualityRow = document.createElement('div');
         qualityRow.className = 'quality-row';
@@ -176,6 +197,15 @@
         `;
         card.appendChild(qualityRow);
         loadHLSQualities(item.url, qualityRow, index);
+      } else if (isDash) {
+        const qualityRow = document.createElement('div');
+        qualityRow.className = 'quality-row';
+        qualityRow.innerHTML = `
+          <span class="quality-label">DASH:</span>
+          <span class="quality-loading">Inspecting MPD manifest...</span>
+        `;
+        card.appendChild(qualityRow);
+        loadDASHQualities(item.url, qualityRow, index);
       }
 
       // Progress / status area
@@ -184,11 +214,20 @@
       statusArea.id = `status-${index}`;
       card.appendChild(statusArea);
 
-      // Attach download click handler
-      const dlBtn = card.querySelector('.download-btn');
-      dlBtn.addEventListener('click', function () {
-        handleDownload(item, index, card);
-      });
+      // Attach download click handlers
+      const nativeBtn = card.querySelector('.native-dl-btn');
+      if (nativeBtn) {
+        nativeBtn.addEventListener('click', function () {
+          handleNativeDownload(item, index, card);
+        });
+      }
+
+      const browserBtn = card.querySelector('.browser-dl-btn');
+      if (browserBtn && !isDash) {
+        browserBtn.addEventListener('click', function () {
+          handleDownload(item, index, card);
+        });
+      }
 
       mediaListEl.appendChild(card);
     });
@@ -211,110 +250,336 @@
     }
   }
 
-  // ───────── HLS Quality Loading ─────────
+  function formatDuration(seconds) {
+    if (!seconds || isNaN(seconds) || seconds <= 0) return '00:00';
+    const s = Math.floor(seconds);
+    const hrs = Math.floor(s / 3600);
+    const mins = Math.floor((s % 3600) / 60);
+    const secs = s % 60;
+    if (hrs > 0) {
+      return `${hrs}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+    }
+    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  }
+
+  // ───────── HLS Quality & Media Info Loading ─────────
 
   function loadHLSQualities(url, qualityRow, index) {
     chrome.runtime.sendMessage({ action: 'parseM3U8', url: url }, function (response) {
       qualityRow.innerHTML = '';
 
-      // Background returns { success, data: { type: 'master', variants } }
       const parsed = response && response.success ? response.data : null;
-      const variants = (parsed && parsed.type === 'master' && Array.isArray(parsed.variants))
-        ? parsed.variants
-        : [];
-
-      if (chrome.runtime.lastError || variants.length === 0) {
-        // No variant streams found — just show "Default" option
+      if (chrome.runtime.lastError || !parsed) {
         qualityRow.innerHTML = `
-          <span class="quality-label">Quality:</span>
-          <select class="quality-select" data-index="${index}">
-            <option value="">Default</option>
-          </select>
+          <span class="quality-label">Stream:</span>
+          <span class="quality-info">Standard Playlist</span>
         `;
         return;
       }
 
-      const label = document.createElement('span');
-      label.className = 'quality-label';
-      label.textContent = 'Quality:';
-
-      const select = document.createElement('select');
-      select.className = 'quality-select';
-      select.dataset.index = index;
-
-      // Sort variants by bandwidth descending (highest quality first)
-      const sorted = variants.slice().sort(function (a, b) {
-        return (b.bandwidth || 0) - (a.bandwidth || 0);
-      });
-
-      sorted.forEach(function (stream, i) {
-        const opt = document.createElement('option');
-        opt.value = stream.url || '';
-        if (stream.audioUrl) {
-          opt.dataset.audioUrl = stream.audioUrl;
+      // Check DRM
+      if (parsed.isDrmProtected) {
+        qualityRow.innerHTML = `
+          <div class="drm-warning-pill" title="DRM-protected, can't be downloaded">
+            🔒 DRM-protected, can't be downloaded
+          </div>
+        `;
+        const card = qualityRow.closest('.media-card');
+        if (card) {
+          card.querySelectorAll('button').forEach(btn => {
+            btn.disabled = true;
+            btn.title = "DRM-protected, can't be downloaded";
+            btn.style.opacity = '0.5';
+            btn.style.cursor = 'not-allowed';
+          });
         }
+        return;
+      }
 
-        let text = '';
-        if (stream.resolution) {
-          // Extract height for "1080p" style label
-          const parts = stream.resolution.split('x');
-          const height = parts.length === 2 ? parts[1] : stream.resolution;
-          text = height + 'p';
-        } else {
-          text = 'Stream ' + (i + 1);
-        }
-        if (stream.bandwidth) {
-          const kbps = Math.round(stream.bandwidth / 1000);
-          text += ' \u2014 ' + kbps + 'kbps';
-        }
-        if (stream.audioUrl) {
-          text += ' (with Audio)';
-        }
-        opt.textContent = text;
-        if (i === 0) opt.selected = true;
-        select.appendChild(opt);
-      });
+      // 1. Master Playlist with #EXT-X-STREAM-INF variants -> Quality Picker
+      if (parsed.type === 'master' && Array.isArray(parsed.variants) && parsed.variants.length > 0) {
+        const label = document.createElement('span');
+        label.className = 'quality-label';
+        label.textContent = 'Quality:';
 
-      qualityRow.appendChild(label);
-      qualityRow.appendChild(select);
+        const select = document.createElement('select');
+        select.className = 'quality-select';
+        select.dataset.index = index;
+
+        // Sort variants by bandwidth descending
+        const sorted = parsed.variants.slice().sort(function (a, b) {
+          return (b.bandwidth || 0) - (a.bandwidth || 0);
+        });
+
+        sorted.forEach(function (stream, i) {
+          const opt = document.createElement('option');
+          opt.value = stream.url || '';
+          if (stream.audioUrl) {
+            opt.dataset.audioUrl = stream.audioUrl;
+          }
+
+          let text = '';
+          if (stream.resolution) {
+            const parts = stream.resolution.split('x');
+            const height = parts.length === 2 ? parts[1] : stream.resolution;
+            text = height + 'p';
+          } else {
+            text = 'Stream ' + (i + 1);
+          }
+          if (stream.bandwidth) {
+            const kbps = Math.round(stream.bandwidth / 1000);
+            text += ' \u2014 ' + kbps + ' kbps';
+          }
+          if (stream.audioUrl) {
+            text += ' (with Audio)';
+          }
+          opt.textContent = text;
+          if (i === 0) opt.selected = true;
+          select.appendChild(opt);
+        });
+
+        qualityRow.appendChild(label);
+        qualityRow.appendChild(select);
+        return;
+      }
+
+      // 2. Media Playlist with segments -> Show Segment Count & Total Duration (sum of #EXTINF)
+      if (parsed.type === 'media' && Array.isArray(parsed.segments)) {
+        const segCount = parsed.segments.length;
+        const durStr = formatDuration(parsed.totalDuration);
+        const liveLabel = parsed.hasEndList ? '' : ' <span class="live-tag">LIVE</span>';
+
+        qualityRow.innerHTML = `
+          <div class="media-playlist-stats">
+            <span class="stat-pill"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg> ${segCount} segments</span>
+            <span class="stat-pill"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg> ${durStr}</span>
+            ${liveLabel}
+          </div>
+        `;
+        return;
+      }
+
+      qualityRow.innerHTML = `
+        <span class="quality-label">Quality:</span>
+        <select class="quality-select" data-index="${index}">
+          <option value="">Default</option>
+        </select>
+      `;
     });
   }
 
-  // ───────── Download Handling (Opens in New Tab like Screenshot) ─────────
+  function loadDASHQualities(url, qualityRow, index) {
+    chrome.runtime.sendMessage({ action: 'parseMPD', url: url }, function (response) {
+      qualityRow.innerHTML = '';
 
-  function handleDownload(item, index, card) {
+      if (response && !response.success && response.error) {
+        qualityRow.innerHTML = `
+          <span class="quality-label" style="color:#f44336;">Error:</span>
+          <span class="quality-info" style="color:#f44336;" title="${escapeHtml(response.error)}">${escapeHtml(response.error.slice(0, 80))}...</span>
+        `;
+        return;
+      }
+
+      const parsed = response && response.success ? response.data : null;
+      if (parsed && parsed.isDrmProtected) {
+        qualityRow.innerHTML = `
+          <div class="drm-warning-pill" title="DRM-protected, can't be downloaded">
+            🔒 DRM-protected, can't be downloaded
+          </div>
+        `;
+        const card = qualityRow.closest('.media-card');
+        if (card) {
+          card.querySelectorAll('button').forEach(btn => {
+            btn.disabled = true;
+            btn.title = "DRM-protected, can't be downloaded";
+            btn.style.opacity = '0.5';
+            btn.style.cursor = 'not-allowed';
+          });
+        }
+        return;
+      }
+
+      qualityRow.innerHTML = `
+        <span class="quality-label">Format:</span>
+        <span class="quality-info">DASH (.mpd) — Native Helper (yt-dlp)</span>
+      `;
+    });
+  }
+
+  // ───────── Native Helper & Download Handlers ─────────
+
+  function checkNativeHelperStatus() {
+    if (helperDot) helperDot.className = 'helper-dot checking';
+    if (helperText) helperText.textContent = 'Helper: Checking...';
+
+    chrome.runtime.sendMessage({ action: 'checkNativeHelper' }, function (res) {
+      if (chrome.runtime.lastError || !res || !res.installed) {
+        helperState.checked = true;
+        helperState.installed = false;
+        helperState.data = null;
+        if (helperDot) helperDot.className = 'helper-dot disconnected';
+        if (helperText) helperText.textContent = 'Helper: Not Installed';
+        if (extIdDisplay) extIdDisplay.textContent = chrome.runtime.id;
+      } else {
+        helperState.checked = true;
+        helperState.installed = true;
+        helperState.data = res.data;
+        if (helperDot) helperDot.className = 'helper-dot connected';
+        const hasBoth = res.data && res.data.dependencies && res.data.dependencies.ytdlp && res.data.dependencies.ffmpeg;
+        if (helperText) {
+          helperText.textContent = hasBoth
+            ? 'Helper: Ready (yt-dlp + ffmpeg)'
+            : 'Helper: Warning (yt-dlp/ffmpeg missing)';
+        }
+        if (helperGuideBanner) helperGuideBanner.classList.add('hidden');
+      }
+    });
+  }
+
+  function showHelperGuide() {
+    if (extIdDisplay) extIdDisplay.textContent = chrome.runtime.id;
+    if (helperGuideBanner) helperGuideBanner.classList.remove('hidden');
+  }
+
+  async function handleNativeDownload(item, index, card) {
+    if (!helperState.installed) {
+      showHelperGuide();
+      alert('Native Helper (yt-dlp + ffmpeg) is not installed.\n\nPlease follow the setup guide at the top of the popup to run the installer script in native-host/.');
+      return;
+    }
+
+    const nativeBtn = card.querySelector('.native-dl-btn');
+    const statusArea = card.querySelector('.status-area');
+    if (nativeBtn) {
+      nativeBtn.disabled = true;
+      nativeBtn.className = 'native-dl-btn downloading';
+      nativeBtn.innerHTML = '<span>⏳ Downloading...</span>';
+    }
+    if (statusArea) {
+      statusArea.classList.remove('hidden');
+      statusArea.innerHTML = '<div style="color:#64b5f6; font-size:11px;">Sending job to yt-dlp... Saving to ~/Downloads</div>';
+    }
+
+    let activePageUrl = item.pageUrl || '';
+    if (!activePageUrl) {
+      try {
+        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (activeTab && activeTab.url) activePageUrl = activeTab.url;
+      } catch {}
+    }
+
+    let downloadUrl = cleanStreamUrl(item.url);
+    const qualitySelect = card.querySelector('.quality-select');
+    if (qualitySelect && qualitySelect.value) {
+      downloadUrl = qualitySelect.value;
+    }
+
+    chrome.runtime.sendMessage({
+      action: 'startNativeDownload',
+      url: downloadUrl,
+      pageUrl: activePageUrl,
+      referer: item.referer || activePageUrl,
+      origin: item.origin || '',
+      ua: item.userAgent || ''
+    }, function (response) {
+      if (chrome.runtime.lastError || !response || !response.success) {
+        const errMsg = response ? response.log || response.error : (chrome.runtime.lastError ? chrome.runtime.lastError.message : 'Download failed');
+        console.error('Native download error:', errMsg);
+        if (nativeBtn) {
+          nativeBtn.disabled = false;
+          nativeBtn.className = 'native-dl-btn failed';
+          nativeBtn.innerHTML = '<span>❌ Failed</span>';
+        }
+        if (statusArea) {
+          statusArea.innerHTML = `
+            <div style="color:#f44336; font-size:11px; margin-bottom:4px;">❌ ${escapeHtml((errMsg || '').slice(0, 150))}...</div>
+            <button class="download-btn browser-dl-btn" style="font-size:10px; padding:3px 8px;">Try Browser Downloader</button>
+          `;
+          const retryBrowserBtn = statusArea.querySelector('.browser-dl-btn');
+          if (retryBrowserBtn) {
+            retryBrowserBtn.addEventListener('click', () => handleDownload(item, index, card));
+          }
+        }
+      } else {
+        if (nativeBtn) {
+          nativeBtn.className = 'native-dl-btn done';
+          nativeBtn.innerHTML = '<span>✅ Saved</span>';
+        }
+        if (statusArea) {
+          statusArea.innerHTML = '<div style="color:#00e676; font-size:11px; font-weight:600;">✅ Saved to ~/Downloads!</div>';
+        }
+      }
+    });
+  }
+
+  // ───────── Download Handling (Opens downloader.html in New Tab) ─────────
+
+  function cleanStreamUrl(urlStr) {
+    if (!urlStr) return '';
+    try {
+      const u = new URL(urlStr);
+      u.searchParams.delete('range');
+      u.searchParams.delete('rn');
+      u.searchParams.delete('rbuf');
+      u.searchParams.delete('start');
+      u.searchParams.delete('end');
+      return u.href;
+    } catch {}
+    return urlStr;
+  }
+
+  async function handleDownload(item, index, card) {
     const filename = getSafeFilename(item);
-    let downloadUrl = item.url;
-    let audioUrl = item.audioUrl || '';
+    let downloadUrl = cleanStreamUrl(item.url);
+    let chosenVariant = '';
+    let audioUrl = item.audioUrl ? cleanStreamUrl(item.audioUrl) : '';
+
+    const isAudioItem = item.type === 'audio' ||
+                        (item.format && ['m4a', 'mp3', 'aac', 'wav', 'ogg'].includes(item.format.toLowerCase())) ||
+                        (item.url && (item.url.includes('mime=audio') || item.url.includes('mime%2faudio')));
 
     // If HLS quality select is present and chosen
     const qualitySelect = card.querySelector('.quality-select');
     if (qualitySelect && qualitySelect.value) {
-      downloadUrl = qualitySelect.value;
+      chosenVariant = qualitySelect.value;
+      downloadUrl = chosenVariant;
       const selOpt = qualitySelect.selectedOptions ? qualitySelect.selectedOptions[0] : null;
       if (selOpt && selOpt.dataset.audioUrl) {
         audioUrl = selOpt.dataset.audioUrl;
       }
     }
 
-    // Automatically pair video-only stream with detected audio track from the same page
-    if (!audioUrl) {
+    // Automatically pair video-only stream with detected audio track from the same page (ONLY if downloading video)
+    if (!audioUrl && !isAudioItem) {
       const allItems = window._svd_mediaItems || [];
       const audioItem = allItems.find(m => m.type === 'audio' || (m.url && (m.url.includes('mime=audio') || m.url.includes('mime%2faudio'))));
       if (audioItem && audioItem.url !== downloadUrl) {
-        audioUrl = audioItem.url;
+        audioUrl = cleanStreamUrl(audioItem.url);
       }
     }
 
-    // Open CocoCut-style Caching Downloader Tab in a new tab
+    const detectedType = isAudioItem ? 'audio' : (item.type || 'video');
+    const detectedFormat = item.format || (isAudioItem ? 'm4a' : 'mp4');
+
+    // Retrieve active tab URL to pass as Referer/Origin
+    let activePageUrl = '';
+    try {
+      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (activeTab && activeTab.url) activePageUrl = activeTab.url;
+    } catch {}
+
+    // Open downloader.html in a new tab (conforming to specification)
     let dlUrl = chrome.runtime.getURL(
-      `download.html?url=${encodeURIComponent(downloadUrl)}&originalUrl=${encodeURIComponent(item.url)}&type=${encodeURIComponent(item.type || 'video')}&title=${encodeURIComponent(filename)}`
+      `downloader.html?url=${encodeURIComponent(item.url)}&variant=${encodeURIComponent(chosenVariant || downloadUrl)}&type=${encodeURIComponent(detectedType)}&format=${encodeURIComponent(detectedFormat)}&title=${encodeURIComponent(filename)}`
     );
-    if (audioUrl) {
+    if (activePageUrl) {
+      dlUrl += `&referer=${encodeURIComponent(activePageUrl)}`;
+    }
+    if (audioUrl && !isAudioItem) {
       dlUrl += `&audioUrl=${encodeURIComponent(audioUrl)}`;
     }
-    if (item.format) {
-      dlUrl += `&format=${encodeURIComponent(item.format)}`;
+    if (item.size && item.size > 65536) {
+      dlUrl += `&size=${encodeURIComponent(item.size)}`;
     }
 
     chrome.tabs.create({ url: dlUrl });
@@ -544,9 +809,36 @@
     checkVideoRecorderStatus();
   });
 
+  if (checkHelperBtn) {
+    checkHelperBtn.addEventListener('click', function () {
+      checkNativeHelperStatus();
+      setTimeout(function () {
+        if (!helperState.installed) {
+          showHelperGuide();
+        }
+      }, 350);
+    });
+  }
+
+  if (closeHelperGuide) {
+    closeHelperGuide.addEventListener('click', function () {
+      if (helperGuideBanner) helperGuideBanner.classList.add('hidden');
+    });
+  }
+
+  if (copyExtIdBtn) {
+    copyExtIdBtn.addEventListener('click', function () {
+      const id = chrome.runtime.id;
+      navigator.clipboard.writeText(id).then(function () {
+        copyExtIdBtn.textContent = 'Copied!';
+        setTimeout(function () { copyExtIdBtn.textContent = 'Copy ID'; }, 2000);
+      });
+    });
+  }
+
   if (openDownloaderBtn) {
     openDownloaderBtn.addEventListener('click', function () {
-      chrome.tabs.create({ url: chrome.runtime.getURL('download.html') });
+      chrome.tabs.create({ url: chrome.runtime.getURL('downloader.html') });
       window.close();
     });
   }
@@ -559,6 +851,7 @@
 
   // ───────── Init ─────────
 
+  checkNativeHelperStatus();
   loadMedia();
   checkVideoRecorderStatus();
 })();

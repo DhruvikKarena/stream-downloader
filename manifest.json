@@ -8,7 +8,9 @@
     "storage",
     "activeTab",
     "tabs",
-    "downloads"
+    "downloads",
+    "declarativeNetRequest",
+    "nativeMessaging"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -40,7 +42,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["inject.js"],
+      "resources": ["inject.js", "lib/mux.min.js"],
       "matches": ["<all_urls>"]
     }
   ],

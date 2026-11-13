@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stream Downloader — Multi-Threaded HLS Engine</title>
+  <link rel="stylesheet" href="downloader.css">
+</head>
+<body>
+  <div class="cococut-app">
+    <!-- Top Navigation Bar -->
+    <nav class="top-nav">
+      <div class="nav-left">
+        <svg class="nav-logo" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="5 3 19 12 5 21 5 3"></polygon>
+        </svg>
+        <span class="nav-title">Stream Downloader</span>
+        <span class="version-badge">HLS / fMP4 / AES-128</span>
+      </div>
+      <div class="nav-links">
+        <a href="#" class="nav-link active">HOME</a>
+        <a href="#" class="nav-link" id="nav-tools">TOOLS</a>
+      </div>
+    </nav>
+
+    <!-- Main Content Container -->
+    <main class="main-content">
+      <!-- Turbo Engine Notice Banner -->
+      <div class="turbo-banner">
+        <div class="turbo-banner-text">
+          <strong>Multi-Thread HLS Downloader Engine:</strong>
+          <span>Downloads segments concurrently with in-order assembly, AES-128 decryption, and direct disk streaming.</span>
+        </div>
+        <div class="turbo-banner-actions">
+          <button id="turbo-boost-btn" class="btn-turbo">Turbo (16 Threads)</button>
+        </div>
+      </div>
+
+      <!-- DRM Protection Warning Banner (Hidden by default) -->
+      <div id="drm-banner" class="alert-banner drm-banner hidden">
+        <div class="alert-icon">🔒</div>
+        <div class="alert-content">
+          <strong>This stream is DRM-protected and can't be downloaded</strong>
+          <p>The stream uses SAMPLE-AES, Widevine, FairPlay, or PlayReady DRM encryption. Downloading DRM-encrypted content without licensing keys is not supported.</p>
+        </div>
+      </div>
+
+      <!-- Live Stream Detection Banner (Hidden by default) -->
+      <div id="live-banner" class="alert-banner live-banner hidden">
+        <div class="alert-icon">🔴</div>
+        <div class="alert-content">
+          <strong>Live stream detected (no endlist)</strong>
+          <p>This is a live broadcast with an open-ended playlist. You can record the stream continuously until you click "Stop & Save".</p>
+        </div>
+        <button id="live-record-btn" class="btn-live-record">Record Live Stream</button>
+        <button id="live-stop-btn" class="btn-live-stop hidden">Stop & Save Recording</button>
+      </div>
+
+      <!-- Core CocoCut-Style Caching Box -->
+      <section class="caching-box" id="caching-box">
+        <div class="caching-top-row">
+          <div class="caching-icon-wrapper">
+            <!-- Hourglass Icon -->
+            <svg class="hourglass-icon" width="46" height="46" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M5 22h14"></path>
+              <path d="M5 2h14"></path>
+              <path d="M17 22v-4.172a2 2 0 0 0-.586-1.414L12 12l-4.414 4.414A2 2 0 0 0 7 17.828V22"></path>
+              <path d="M7 2v4.172a2 2 0 0 0 .586 1.414L12 12l4.414-4.414A2 2 0 0 0 17 6.172V2"></path>
+            </svg>
+          </div>
+
+          <div class="caching-info-col">
+            <div class="caching-status-header">
+              <span class="caching-pulse-dot"></span>
+              <span id="caching-status-label" class="caching-title">Initializing Stream Downloader...</span>
+              <span id="pipeline-step-badge" class="pipeline-badge step-downloading">Step 1: Downloading Segments</span>
+            </div>
+            <div id="caching-filename" class="caching-file-title" title="Loading stream...">video_download.mp4</div>
+
+            <!-- Two-Tone Progress Bar Container -->
+            <div class="progress-bar-container">
+              <div class="progress-bar-track">
+                <div id="progress-bar-fill" class="progress-bar-fill" style="width: 0%;"></div>
+                <div id="progress-bar-buffered" class="progress-bar-buffered" style="width: 0%;"></div>
+              </div>
+              <div class="bar-inline-controls">
+                <button id="pause-btn" class="bar-ctrl-btn" title="Pause / Resume Caching">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                    <rect x="6" y="4" width="4" height="16"></rect>
+                    <rect x="14" y="4" width="4" height="16"></rect>
+                  </svg>
+                </button>
+                <button id="cancel-btn" class="bar-ctrl-btn" title="Cancel / Stop">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <line x1="4.93" y1="4.93" x2="19.07" y2="19.07"></line>
+                  </svg>
+                </button>
+              </div>
+            </div>
+
+            <!-- Real-time Stats line -->
+            <div id="caching-stats" class="caching-stats-line">
+              Segments: 0 / 0 (0.0%), Size: 0.0 MB, Speed: 0.0 KB/s, ETA: --:--:--, Retries: 0, Threads: 6
+            </div>
+          </div>
+        </div>
+
+        <!-- Caching Action Buttons & Toggles -->
+        <div class="caching-bottom-row">
+          <div class="caching-actions-left">
+            <button id="save-btn" class="action-btn btn-save" title="Save cached video file to disk">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="7 10 12 15 17 10"></polyline>
+                <line x1="12" y1="15" x2="12" y2="3"></line>
+              </svg>
+              <span id="save-btn-text">Save Video File</span>
+            </button>
+            <button id="boost-speed-btn" class="action-btn btn-boost" title="Boost speed with 16 threads">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+              </svg>
+              <span>Boost download speed</span>
+            </button>
+          </div>
+
+          <div class="caching-toggles-right">
+            <label class="toggle-control" title="Stream directly to disk with showSaveFilePicker to prevent high memory usage on large files">
+              <input type="checkbox" id="stream-disk-toggle" checked>
+              <span class="toggle-slider"></span>
+              <span class="toggle-label">💾 Stream to Disk (FSA)</span>
+            </label>
+            <label class="toggle-control" title="Automatically trigger download when 100% complete">
+              <input type="checkbox" id="auto-save-toggle" checked>
+              <span class="toggle-slider"></span>
+              <span class="toggle-label">💎 Auto save</span>
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <!-- Settings & Stream Options -->
+      <section class="card-collapsible">
+        <div class="card-collapsible-header" id="details-toggle">
+          <div class="details-header-title">
+            <span class="details-icon">⚙️</span>
+            <span>Stream Settings & Formats</span>
+          </div>
+          <span class="badge" id="stream-type-badge">HLS</span>
+        </div>
+        <div class="card-collapsible-body" id="details-body">
+          <div class="form-row">
+            <div class="form-group flex-2">
+              <label for="filename-input">File Name</label>
+              <div class="input-with-ext">
+                <input type="text" id="filename-input" placeholder="video_download" spellcheck="false">
+                <span id="file-ext-label" class="ext-label">.mp4</span>
+              </div>
+            </div>
+
+            <div class="form-group flex-1">
+              <label for="output-format-select">Output Format</label>
+              <select id="output-format-select" class="form-select">
+                <option value="mp4" selected>MP4 (Transmux via mux.js)</option>
+                <option value="ts">Raw MPEG-TS (.ts)</option>
+              </select>
+            </div>
+
+            <div class="form-group flex-1 hidden" id="quality-section">
+              <label for="quality-select">Resolution / Quality</label>
+              <select id="quality-select" class="form-select"></select>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="url-display">Playlist URL</label>
+            <div class="url-bar">
+              <input type="text" id="url-display" readonly spellcheck="false">
+              <button id="copy-url-btn" class="btn-copy" title="Copy URL">Copy</button>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Worker Thread Pool (Parallel Concurrency)</label>
+            <div class="thread-selector" id="thread-buttons">
+              <button type="button" class="thread-btn" data-threads="1">1</button>
+              <button type="button" class="thread-btn" data-threads="2">2</button>
+              <button type="button" class="thread-btn" data-threads="4">4</button>
+              <button type="button" class="thread-btn active" data-threads="6">6 (Default)</button>
+              <button type="button" class="thread-btn" data-threads="8">8 (Fast)</button>
+              <button type="button" class="thread-btn" data-threads="16">16 (Turbo)</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Live Segment Matrix (Real-Time Chunk Grid) -->
+      <section class="card-collapsible">
+        <div class="card-collapsible-header">
+          <div class="details-header-title">
+            <span class="details-icon">📊</span>
+            <span>Segment Matrix (Real-Time Threads)</span>
+          </div>
+          <div class="segment-legend">
+            <span class="legend-item"><span class="dot dot-waiting"></span> Pending</span>
+            <span class="legend-item"><span class="dot dot-active"></span> Caching</span>
+            <span class="legend-item"><span class="dot dot-done"></span> Cached</span>
+          </div>
+        </div>
+        <div class="card-collapsible-body">
+          <div id="segments-grid" class="segments-grid">
+            <div class="empty-segments-msg">Segment visualization will appear once playlist is loaded.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Error / Notice Box with Retry Button -->
+      <div id="notice-box" class="notice-box hidden">
+        <span id="notice-text"></span>
+        <button id="retry-btn" class="btn-retry hidden">Retry</button>
+      </div>
+    </main>
+
+    <!-- Footer -->
+    <footer class="app-footer">
+      <span>Stream Downloader — Multi-Threaded HLS / fMP4 Engine</span>
+    </footer>
+  </div>
+
+  <!-- Local Bundled Dependencies (No CDN) -->
+  <script src="lib/mux.min.js"></script>
+  <!-- Downloader Script -->
+  <script src="downloader.js"></script>
+</body>
+</html>
+

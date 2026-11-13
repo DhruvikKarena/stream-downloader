@@ -219,6 +219,50 @@ body {
 .type-badge.video-audio { background: #2ea043; }
 .type-badge.other { background: var(--badge-other); }
 
+/* ===== Media Playlist Stats & DRM Indicators ===== */
+.media-playlist-stats {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.stat-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+  padding: 2px 7px;
+  font-size: 11px;
+  color: #c9d1d9;
+}
+
+.live-tag {
+  background: #d32f2f;
+  color: #fff;
+  font-size: 9px;
+  font-weight: 800;
+  padding: 1px 5px;
+  border-radius: 3px;
+  letter-spacing: 0.5px;
+}
+
+.drm-warning-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: rgba(255, 77, 79, 0.15);
+  border: 1px solid rgba(255, 77, 79, 0.4);
+  color: #ff7875;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 4px;
+  margin-top: 4px;
+}
+
 /* ===== Record Banner (CocoCut Recording Mode) ===== */
 .record-banner {
   margin: 8px 12px 2px;
@@ -620,6 +664,189 @@ body {
 
 .refresh-btn:hover svg {
   transform: rotate(90deg);
+}
+
+/* ===== Native Helper Status Bar ===== */
+.helper-status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 14px;
+  background: rgba(0, 0, 0, 0.25);
+  border-bottom: 1px solid var(--border);
+}
+
+.helper-status-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.helper-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ffb300;
+  box-shadow: 0 0 6px #ffb300;
+}
+
+.helper-dot.connected {
+  background: #00e676;
+  box-shadow: 0 0 8px #00e676;
+}
+
+.helper-dot.disconnected {
+  background: #ff5252;
+  box-shadow: 0 0 8px #ff5252;
+}
+
+.helper-dot.checking {
+  background: #ffb300;
+  box-shadow: 0 0 6px #ffb300;
+  animation: pulse-dot 1.2s infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.85); }
+}
+
+.helper-status-text {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.helper-action-btn {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: var(--text-primary);
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.helper-action-btn:hover {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+/* ===== Helper Guide Banner ===== */
+.helper-guide-banner {
+  display: flex;
+  position: relative;
+  background: linear-gradient(135deg, rgba(33, 150, 243, 0.15), rgba(15, 52, 96, 0.4));
+  border: 1px solid rgba(33, 150, 243, 0.35);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  margin: 8px 12px 4px 12px;
+  gap: 8px;
+}
+
+.helper-guide-content {
+  flex: 1;
+}
+
+.helper-guide-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: #64b5f6;
+  margin-bottom: 2px;
+}
+
+.helper-guide-desc {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+  line-height: 1.3;
+}
+
+.helper-guide-steps {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.helper-guide-steps code {
+  background: rgba(0, 0, 0, 0.4);
+  padding: 1px 4px;
+  border-radius: 3px;
+  color: #81c784;
+}
+
+.copy-pill-btn {
+  background: #0288d1;
+  color: #fff;
+  border: none;
+  font-size: 9.5px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  margin-left: 4px;
+}
+
+.copy-pill-btn:hover {
+  background: #039be5;
+}
+
+.helper-close-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 16px;
+  cursor: pointer;
+  height: 20px;
+  line-height: 16px;
+}
+
+.helper-close-btn:hover {
+  color: var(--text-primary);
+}
+
+/* Download Action Buttons */
+.media-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.native-dl-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 9px;
+  background: #0288d1;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.native-dl-btn:hover {
+  background: #039be5;
+}
+
+.native-dl-btn.downloading {
+  background: #ffb300;
+  color: #000;
+  cursor: wait;
+}
+
+.native-dl-btn.done {
+  background: #4caf50;
+}
+
+.native-dl-btn.failed {
+  background: #f44336;
 }
 
 /* ===== Utility ===== */

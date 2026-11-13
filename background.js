@@ -159,12 +159,12 @@ function isIgnoredDomain(urlStr) {
 function cleanMediaUrl(urlStr) {
   try {
     const u = new URL(urlStr);
-    if (u.hostname.includes('googlevideo.com') && u.pathname.includes('videoplayback')) {
-      u.searchParams.delete('range');
-      u.searchParams.delete('rn');
-      u.searchParams.delete('rbuf');
-      return u.href;
-    }
+    u.searchParams.delete('range');
+    u.searchParams.delete('rn');
+    u.searchParams.delete('rbuf');
+    u.searchParams.delete('start');
+    u.searchParams.delete('end');
+    return u.href;
   } catch {}
   return urlStr;
 }
@@ -331,26 +331,41 @@ async function addMediaItem(tabId, rawUrl, type, source = 'webRequest', size = 0
     mediaByTab.set(tabId, items);
   }
 
-  // Deduplicate by URL
-  if (items.some(m => m.url === url)) return;
-
-  // Deduplicate YouTube streams by video ID & itag
-  try {
-    const u = new URL(url);
-    if (u.hostname.includes('googlevideo.com')) {
-      const id = u.searchParams.get('id');
-      const itag = u.searchParams.get('itag');
-      if (id && itag) {
-        const exists = items.some(m => {
-          try {
-            const mu = new URL(m.url);
-            return mu.searchParams.get('id') === id && mu.searchParams.get('itag') === itag;
-          } catch { return false; }
-        });
-        if (exists) return;
+  // Deduplicate by URL or YouTube stream itag
+  let existing = items.find(m => m.url === url);
+  if (!existing) {
+    try {
+      const u = new URL(url);
+      if (u.hostname.includes('googlevideo.com')) {
+        const id = u.searchParams.get('id');
+        const itag = u.searchParams.get('itag');
+        if (id && itag) {
+          existing = items.find(m => {
+            try {
+              const mu = new URL(m.url);
+              return mu.searchParams.get('id') === id && mu.searchParams.get('itag') === itag;
+            } catch { return false; }
+          });
+        }
       }
+    } catch {}
+  }
+
+  // If item already exists, update size if we discovered a larger/true size
+  if (existing) {
+    if (extraMeta.referer && !existing.referer) existing.referer = extraMeta.referer;
+    if (extraMeta.origin && !existing.origin) existing.origin = extraMeta.origin;
+    if (extraMeta.userAgent && !existing.userAgent) existing.userAgent = extraMeta.userAgent;
+    if (extraMeta.pageUrl && !existing.pageUrl) existing.pageUrl = extraMeta.pageUrl;
+    if (size && size > (existing.size || 0)) {
+      existing.size = size;
+      if (extraMeta.format && !existing.format) existing.format = extraMeta.format;
+      if (extraMeta.resolution && !existing.resolution) existing.resolution = extraMeta.resolution;
     }
-  } catch {}
+    persistTab(tabId);
+    updateBadge(tabId);
+    return;
+  }
 
   // For .ts files, skip if we already track an HLS playlist for this tab
   if (type === 'ts') {
@@ -388,7 +403,11 @@ async function addMediaItem(tabId, rawUrl, type, source = 'webRequest', size = 0
     hasAudio: extraMeta.hasAudio !== undefined ? extraMeta.hasAudio : (type === 'video' || type === 'hls'),
     resolution: extraMeta.resolution || '',
     quality: extraMeta.quality || '',
-    format: extraMeta.format || ''
+    format: extraMeta.format || '',
+    referer: extraMeta.referer || '',
+    origin: extraMeta.origin || '',
+    userAgent: extraMeta.userAgent || '',
+    pageUrl: extraMeta.pageUrl || ''
   };
 
   items.push(item);
@@ -425,7 +444,7 @@ chrome.webRequest.onBeforeRequest.addListener(
   { urls: ['<all_urls>'] }
 );
 
-// B. On headers received (Content-Type & Content-Length inspection)
+// B. On headers received (Content-Type, Content-Length & Content-Range inspection)
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
     const { url, tabId, responseHeaders } = details;
@@ -433,26 +452,120 @@ chrome.webRequest.onHeadersReceived.addListener(
 
     let contentType = '';
     let contentLength = 0;
+    let contentRangeTotal = 0;
     if (responseHeaders) {
       for (const h of responseHeaders) {
         const name = (h.name || '').toLowerCase();
-        if (name === 'content-type') contentType = h.value || '';
-        else if (name === 'content-length') contentLength = parseInt(h.value, 10) || 0;
+        if (name === 'content-type') {
+          contentType = h.value || '';
+        } else if (name === 'content-length') {
+          contentLength = parseInt(h.value, 10) || 0;
+        } else if (name === 'content-range') {
+          const m = (h.value || '').match(/\/(\d+)$/);
+          if (m) contentRangeTotal = parseInt(m[1], 10) || 0;
+        }
       }
     }
 
+    // Check clen in URL
+    let clenSize = 0;
+    try {
+      const u = new URL(url);
+      const clen = u.searchParams.get('clen');
+      if (clen) clenSize = parseInt(clen, 10) || 0;
+    } catch {}
+
+    const trueSize = contentRangeTotal || clenSize || contentLength;
+
     const meta = classifyMediaUrl(url, contentType);
     if (meta && meta.type) {
-      addMediaItem(tabId, url, meta.type, 'headers', contentLength, meta);
+      addMediaItem(tabId, url, meta.type, 'headers', trueSize, meta);
     }
   },
   { urls: ['<all_urls>'] },
   ['responseHeaders']
 );
 
+// C. On send headers — detects .m3u8, .mpd, direct .mp4/.webm with Referer, Origin, User-Agent (ignoring .ts/.m4s)
+chrome.webRequest.onSendHeaders.addListener(
+  (details) => {
+    const { url, tabId, requestHeaders } = details;
+    if (tabId < 0 || isIgnoredDomain(url)) return;
+
+    // Ignore individual segments (.ts, .m4s, chunk files)
+    const lower = url.toLowerCase();
+    const pathname = (urlPathname(url) || '').toLowerCase();
+    if (pathname.endsWith('.ts') || pathname.endsWith('.m4s') ||
+        /\.(ts|m4s)($|\?|#)/i.test(url) ||
+        lower.includes('/segment') || lower.includes('seg-')) {
+      return;
+    }
+
+    // Detect .m3u8, .mpd, and direct .mp4/.webm requests
+    let mediaType = null;
+    let format = '';
+    if (/\.m3u8($|\?|#)/i.test(url) || lower.includes('.m3u8')) {
+      mediaType = 'hls';
+      format = 'm3u8';
+    } else if (/\.mpd($|\?|#)/i.test(url) || lower.includes('.mpd')) {
+      mediaType = 'dash';
+      format = 'mpd';
+    } else if (/\.mp4($|\?|#)/i.test(url) || lower.includes('.mp4') || lower.includes('mime=video%2fmp4') || lower.includes('mime=video/mp4')) {
+      mediaType = 'video';
+      format = 'mp4';
+    } else if (/\.webm($|\?|#)/i.test(url) || lower.includes('.webm') || lower.includes('mime=video%2fwebm') || lower.includes('mime=video/webm')) {
+      mediaType = 'video';
+      format = 'webm';
+    } else if (lower.includes('videoplayback')) {
+      const classified = classifyMediaUrl(url);
+      if (classified) {
+        mediaType = classified.type;
+        format = classified.format || 'mp4';
+      }
+    }
+
+    if (!mediaType) return;
+
+    // Extract Referer, Origin, and User-Agent
+    let referer = '';
+    let origin = '';
+    let userAgent = '';
+    if (requestHeaders) {
+      for (const h of requestHeaders) {
+        const name = (h.name || '').toLowerCase();
+        if (name === 'referer') referer = h.value || '';
+        else if (name === 'origin') origin = h.value || '';
+        else if (name === 'user-agent') userAgent = h.value || '';
+      }
+    }
+
+    chrome.tabs.get(tabId, (tab) => {
+      const pageUrl = (tab && tab.url) ? tab.url : (referer || '');
+      addMediaItem(tabId, url, mediaType, 'onSendHeaders', 0, {
+        referer,
+        origin,
+        userAgent,
+        pageUrl,
+        format
+      });
+    });
+  },
+  { urls: ['<all_urls>'] },
+  ['requestHeaders', 'extraHeaders']
+);
+
 // ---------------------------------------------------------------------------
-// 7. Tab cleanup
+// 7. Tab cleanup (navigation & closure)
 // ---------------------------------------------------------------------------
+
+// Clear entries when a tab navigates to a new page or reloads
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === 'loading' && changeInfo.url) {
+    mediaByTab.delete(tabId);
+    chrome.storage.session.remove(storageKey(tabId)).catch(() => {});
+    updateBadge(tabId);
+  }
+});
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   mediaByTab.delete(tabId);
@@ -469,29 +582,56 @@ chrome.tabs.onRemoved.addListener((tabId) => {
  * @returns {Promise<Object>} Parsed result.
  */
 async function parseM3U8(m3u8Url) {
-  const response = await fetch(m3u8Url, {
-    headers: { 'Accept': '*/*' },
-    credentials: 'include',
-  });
-  if (!response.ok) {
-    throw new Error(`Failed to fetch m3u8: HTTP ${response.status}`);
+  let response;
+  try {
+    response = await fetch(m3u8Url, {
+      headers: { 'Accept': '*/*' },
+      credentials: 'include',
+    });
+  } catch (err) {
+    throw new Error(`Network error fetching playlist: ${err.message}`);
   }
+
+  const status = response.status;
   const text = await response.text();
-  return parseM3U8Text(text, m3u8Url);
+  return parseM3U8Text(text, m3u8Url, status);
 }
 
 /**
- * Parse raw M3U8 text content.
- * @param {string} text      - The raw playlist text.
- * @param {string} baseUrl   - URL used to resolve relative paths.
- * @returns {Object}          Parsed playlist descriptor.
+ * Parse raw M3U8 text content with DRM detection & HTTP snippet reporting.
+ * @param {string} text        - The raw playlist text.
+ * @param {string} baseUrl     - URL used to resolve relative paths.
+ * @param {number} httpStatus  - HTTP response status code.
+ * @returns {Object}            Parsed playlist descriptor.
  */
-function parseM3U8Text(text, baseUrl) {
-  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
-
-  if (!lines[0] || !lines[0].startsWith('#EXTM3U')) {
-    throw new Error('Invalid M3U8: missing #EXTM3U header');
+function parseM3U8Text(text, baseUrl, httpStatus = 200) {
+  const clean = (text || '').replace(/^\uFEFF/, '').trim();
+  const m3uIndex = clean.indexOf('#EXTM3U');
+  if (m3uIndex === -1) {
+    const snippet = clean.slice(0, 200).replace(/\s+/g, ' ');
+    if (clean.includes('<html') || clean.includes('<!DOCTYPE')) {
+      throw new Error(`Server returned HTTP ${httpStatus}: "${snippet}" (HTML error page, not #EXTM3U)`);
+    }
+    throw new Error(`Server returned HTTP ${httpStatus}: "${snippet}" (Missing #EXTM3U tag)`);
   }
+
+  // DRM Detection in M3U8 (SAMPLE-AES, Widevine, PlayReady, FairPlay)
+  const lower = text.toLowerCase();
+  if (text.includes('METHOD=SAMPLE-AES') ||
+      lower.includes('com.widevine.alpha') ||
+      lower.includes('widevine') ||
+      lower.includes('fairplay') ||
+      lower.includes('com.apple.streamingkeydelivery') ||
+      lower.includes('playready') ||
+      lower.includes('edef8ba9-79d6-4ace-a3c8-27dcd51d21ed')) {
+    return {
+      type: 'drm',
+      isDrmProtected: true,
+      error: "DRM-protected, can't be downloaded"
+    };
+  }
+
+  const lines = clean.slice(m3uIndex).split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
 
   // Determine playlist type.
   const isMaster = lines.some(l => l.startsWith('#EXT-X-STREAM-INF'));
@@ -500,6 +640,53 @@ function parseM3U8Text(text, baseUrl) {
     return parseMasterPlaylist(lines, baseUrl);
   }
   return parseMediaPlaylist(lines, baseUrl);
+}
+
+/**
+ * Fetch and parse a DASH MPD manifest with DRM detection.
+ */
+async function parseMPD(mpdUrl) {
+  let response;
+  try {
+    response = await fetch(mpdUrl, {
+      headers: { 'Accept': '*/*' },
+      credentials: 'include',
+    });
+  } catch (err) {
+    throw new Error(`Network error fetching MPD: ${err.message}`);
+  }
+
+  const status = response.status;
+  const text = await response.text();
+  return parseMPDText(text, mpdUrl, status);
+}
+
+function parseMPDText(text, baseUrl, httpStatus = 200) {
+  const clean = (text || '').replace(/^\uFEFF/, '').trim();
+  if (!clean.includes('<MPD') && !clean.includes('<mpd')) {
+    const snippet = clean.slice(0, 200).replace(/\s+/g, ' ');
+    throw new Error(`Server returned HTTP ${httpStatus}: "${snippet}" (Not a valid DASH MPD manifest)`);
+  }
+
+  const lower = text.toLowerCase();
+  // DRM detection in MPD: ContentProtection tag, Widevine, PlayReady, FairPlay
+  if (clean.includes('<ContentProtection') ||
+      clean.includes('<contentprotection') ||
+      lower.includes('edef8ba9-79d6-4ace-a3c8-27dcd51d21ed') || // Widevine
+      lower.includes('9a04f079-9840-4286-ab92-e65be0885f95') || // PlayReady
+      lower.includes('94ce86fb-07ff-4f43-adb8-93d2fa968ca2')) { // FairPlay
+    return {
+      type: 'dash',
+      isDrmProtected: true,
+      error: "DRM-protected, can't be downloaded"
+    };
+  }
+
+  return {
+    type: 'dash',
+    isDrmProtected: false,
+    textLength: clean.length
+  };
 }
 
 /**
@@ -579,6 +766,8 @@ function parseMediaPlaylist(lines, baseUrl) {
   let targetDuration = 0;
   let version = 0;
   let hasEndList = false;
+  let initSegment = null;
+  let isDrmProtected = false;
 
   for (const line of lines) {
     if (line.startsWith('#EXT-X-VERSION')) {
@@ -589,8 +778,20 @@ function parseMediaPlaylist(lines, baseUrl) {
       mediaSequence = parseInt(line.split(':')[1], 10) || 0;
     } else if (line.startsWith('#EXT-X-KEY')) {
       encryptionInfo = parseKeyTag(line, baseUrl);
+      if (encryptionInfo && encryptionInfo.isDrm) {
+        isDrmProtected = true;
+      }
+    } else if (line.startsWith('#EXT-X-MAP')) {
+      const attrs = line.substring(line.indexOf(':') + 1);
+      const mapUri = extractAttr(attrs, 'URI');
+      if (mapUri) {
+        initSegment = {
+          url: resolveUrl(mapUri, baseUrl)
+        };
+      }
     } else if (line.startsWith('#EXTINF')) {
-      currentDuration = parseFloat(line.split(':')[1]) || 0;
+      const val = line.substring(line.indexOf(':') + 1);
+      currentDuration = parseFloat(val.split(',')[0]) || 0;
     } else if (line.startsWith('#EXT-X-ENDLIST')) {
       hasEndList = true;
     } else if (!line.startsWith('#')) {
@@ -599,7 +800,8 @@ function parseMediaPlaylist(lines, baseUrl) {
       segments.push({
         url: segUrl,
         duration: currentDuration,
-        encryption: encryptionInfo,
+        encryption: encryptionInfo ? { ...encryptionInfo } : null,
+        sequence: mediaSequence + segments.length
       });
       totalDuration += currentDuration;
       currentDuration = 0;
@@ -613,7 +815,9 @@ function parseMediaPlaylist(lines, baseUrl) {
     mediaSequence,
     totalDuration,
     hasEndList,
+    initSegment,
     encryptionInfo,
+    isDrmProtected,
     segments,
   };
 }
@@ -631,11 +835,24 @@ function parseKeyTag(line, baseUrl) {
   const method = extractAttr(attrs, 'METHOD');
   const uri    = extractAttr(attrs, 'URI');
   const iv     = extractAttr(attrs, 'IV');
+  const keyFormat = extractAttr(attrs, 'KEYFORMAT') || '';
+  const keyFormatVersions = extractAttr(attrs, 'KEYFORMATVERSIONS') || '';
+
+  const lowerAttrs = attrs.toLowerCase();
+  const isDrm = method === 'SAMPLE-AES' ||
+                lowerAttrs.includes('widevine') ||
+                lowerAttrs.includes('fairplay') ||
+                lowerAttrs.includes('playready') ||
+                keyFormat.toLowerCase().includes('widevine') ||
+                keyFormat.toLowerCase().includes('streamingkeydelivery');
 
   return {
     method,
     uri: uri ? resolveUrl(uri, baseUrl) : '',
     iv: iv || '',
+    keyFormat,
+    keyFormatVersions,
+    isDrm
   };
 }
 
@@ -929,6 +1146,80 @@ async function startDownload(request) {
   return { success: false, error: `Unknown media type: ${type}` };
 }
 
+/**
+ * Probe a media URL to discover total bytes, MIME type, and byte-range support.
+ * Runs in background service worker context with <all_urls> permission to bypass CORS restrictions.
+ */
+async function probeMediaUrl(rawUrl) {
+  if (!rawUrl) return { totalSize: 0, mimeType: '', isRangeSupported: false };
+  const cleanUrl = cleanMediaUrl(rawUrl);
+  let totalSize = 0;
+  let mimeType = '';
+  let isRangeSupported = false;
+
+  // 1. Check clen query parameter (e.g. YouTube videoplayback)
+  try {
+    const u = new URL(cleanUrl);
+    const clen = u.searchParams.get('clen');
+    if (clen && parseInt(clen, 10) > 65536) {
+      totalSize = parseInt(clen, 10);
+    }
+    const mime = u.searchParams.get('mime');
+    if (mime) mimeType = mime;
+  } catch {}
+
+  // 2. Probe using HTTP Range bytes=0-1
+  if (!totalSize) {
+    try {
+      let probeUrl = cleanUrl;
+      if (probeUrl.includes('googlevideo.com') || probeUrl.includes('videoplayback')) {
+        const u = new URL(probeUrl);
+        u.searchParams.set('range', '0-1');
+        probeUrl = u.href;
+      }
+      const res = await fetch(probeUrl, {
+        headers: { 'Range': 'bytes=0-1' },
+        credentials: 'include'
+      });
+      if (res.headers.get('content-type')) {
+        mimeType = res.headers.get('content-type');
+      }
+      const cr = res.headers.get('content-range');
+      if (cr) {
+        isRangeSupported = true;
+        const m = cr.match(/\/(\d+)$/);
+        if (m && parseInt(m[1], 10) > 65536) {
+          totalSize = parseInt(m[1], 10);
+        }
+      }
+      if (!totalSize) {
+        const cl = res.headers.get('content-length');
+        if (cl && parseInt(cl, 10) > 65536) {
+          totalSize = parseInt(cl, 10);
+        }
+      }
+    } catch (e) {
+      console.warn('Probe error:', e);
+    }
+  }
+
+  // 3. Fallback HEAD request
+  if (!totalSize) {
+    try {
+      const headRes = await fetch(cleanUrl, { method: 'HEAD', credentials: 'include' });
+      const cl = headRes.headers.get('content-length');
+      if (cl && parseInt(cl, 10) > 65536) {
+        totalSize = parseInt(cl, 10);
+      }
+      if (headRes.headers.get('content-type')) {
+        mimeType = headRes.headers.get('content-type');
+      }
+    } catch {}
+  }
+
+  return { totalSize, mimeType, isRangeSupported };
+}
+
 // ---------------------------------------------------------------------------
 // 12. Message handling
 // ---------------------------------------------------------------------------
@@ -975,6 +1266,124 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     sendResponse({ success: true });
     return false;
+  }
+
+  if (action === 'probeMedia') {
+    (async () => {
+      const p1 = await probeMediaUrl(message.url);
+      let audioResult = null;
+      if (message.audioUrl && message.audioUrl !== message.url) {
+        audioResult = await probeMediaUrl(message.audioUrl);
+      }
+      sendResponse({
+        success: true,
+        totalSize: p1.totalSize,
+        mimeType: p1.mimeType,
+        isRangeSupported: p1.isRangeSupported,
+        audioTotalSize: audioResult ? audioResult.totalSize : 0
+      });
+    })();
+    return true; // asynchronous response
+  }
+
+  if (action === 'setDownloadHeaders') {
+    const ruleId = parseInt(message.ruleId, 10) || 8888;
+    const referer = message.referer || '';
+    const origin = message.origin || '';
+    const requestHeaders = [];
+    if (referer) {
+      requestHeaders.push({ header: 'Referer', operation: 'set', value: referer });
+    }
+    if (origin) {
+      requestHeaders.push({ header: 'Origin', operation: 'set', value: origin });
+    }
+
+    if (chrome.declarativeNetRequest && requestHeaders.length > 0) {
+      chrome.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: [ruleId],
+        addRules: [{
+          id: ruleId,
+          priority: 1,
+          action: {
+            type: 'modifyHeaders',
+            requestHeaders
+          },
+          condition: {
+            urlFilter: '*',
+            resourceTypes: ['xmlhttprequest', 'other']
+          }
+        }]
+      }).then(() => sendResponse({ success: true }))
+        .catch(err => {
+          console.warn('updateSessionRules error:', err);
+          sendResponse({ success: false, error: err.message });
+        });
+      return true;
+    }
+    sendResponse({ success: true });
+    return false;
+  }
+
+  if (action === 'clearDownloadHeaders') {
+    const ruleId = parseInt(message.ruleId, 10) || 8888;
+    if (chrome.declarativeNetRequest) {
+      chrome.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: [ruleId]
+      }).then(() => sendResponse({ success: true }))
+        .catch(err => sendResponse({ success: false, error: err.message }));
+      return true;
+    }
+    sendResponse({ success: true });
+    return false;
+  }
+
+  if (action === 'checkNativeHelper') {
+    chrome.runtime.sendNativeMessage('com.example.hlsdl', { action: 'ping' }, (response) => {
+      if (chrome.runtime.lastError) {
+        sendResponse({
+          installed: false,
+          error: chrome.runtime.lastError.message
+        });
+      } else {
+        sendResponse({
+          installed: true,
+          data: response
+        });
+      }
+    });
+    return true; // asynchronous response
+  }
+
+  if (action === 'startNativeDownload') {
+    const payload = {
+      action: 'download',
+      url: message.url || '',
+      pageUrl: message.pageUrl || '',
+      referer: message.referer || '',
+      origin: message.origin || '',
+      ua: message.ua || message.userAgent || ''
+    };
+    chrome.runtime.sendNativeMessage('com.example.hlsdl', payload, (response) => {
+      if (chrome.runtime.lastError) {
+        sendResponse({
+          success: false,
+          error: chrome.runtime.lastError.message
+        });
+      } else {
+        sendResponse({
+          success: response ? !!response.ok : false,
+          log: response ? response.log : 'No response from native helper'
+        });
+      }
+    });
+    return true; // asynchronous response
+  }
+
+  if (action === 'parseMPD') {
+    parseMPD(message.url)
+      .then(result => sendResponse({ success: true, data: result }))
+      .catch(err => sendResponse({ success: false, error: err.message }));
+    return true; // keep channel open
   }
 
   if (action === 'parseM3U8') {

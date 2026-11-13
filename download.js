@@ -34,6 +34,9 @@
 
   let totalBytes = 0;
   let expectedTotalBytes = 0;
+  let isDynamicStreaming = false;
+  let isStreamEofReached = false;
+  let activeWorkers = 0;
   let startTime = 0;
   let speedInterval = null;
   let lastBytes = 0;
@@ -375,74 +378,237 @@
     buildSegmentGrid(segmentsList.length);
   }
 
-  async function setupDirectOrChunkedDownload(url, audioTrackUrl, title) {
-    setStatus('Probing Stream Size...');
-    let totalSize = 0;
-
+  function cleanStreamUrl(urlStr) {
+    if (!urlStr) return '';
     try {
-      const u = new URL(url);
-      const clen = u.searchParams.get('clen');
-      if (clen) totalSize = parseInt(clen, 10);
+      const u = new URL(urlStr);
+      u.searchParams.delete('range');
+      u.searchParams.delete('rn');
+      u.searchParams.delete('rbuf');
+      u.searchParams.delete('start');
+      u.searchParams.delete('end');
+      return u.href;
     } catch {}
+    return urlStr;
+  }
 
+  function isAudioStream(url, type, format) {
+    const lower = (url || '').toLowerCase();
+    const t = (type || '').toLowerCase();
+    const f = (format || '').toLowerCase();
+    return t === 'audio' ||
+           f === 'm4a' || f === 'mp3' || f === 'aac' || f === 'wav' || f === 'ogg' ||
+           lower.includes('mime=audio') || lower.includes('mime%2faudio') || lower.includes('mime%3aaudio') ||
+           lower.includes('audio') || lower.endsWith('.mp3') || lower.endsWith('.m4a') || lower.endsWith('.aac');
+  }
+
+  function expandRemainingSegments(url, fullSize, startOffset, isAudio = false) {
+    expectedTotalBytes = fullSize;
+    isDynamicStreaming = false;
+    const CHUNK_SIZE = fullSize <= 4 * 1048576 ? 524288 : 1048576;
+    let offset = startOffset;
+    const newSegs = [];
+
+    while (offset < fullSize) {
+      const end = Math.min(offset + CHUNK_SIZE - 1, fullSize - 1);
+      const idx = segmentsList.length + newSegs.length;
+      newSegs.push({
+        url: url,
+        range: `bytes=${offset}-${end}`,
+        start: offset,
+        end: end,
+        size: end - offset + 1,
+        isAudio: isAudio,
+        index: idx
+      });
+      offset = end + 1;
+    }
+
+    if (newSegs.length > 0) {
+      segmentsList = segmentsList.concat(newSegs);
+      downloadedBuffers = downloadedBuffers.concat(new Array(newSegs.length));
+      segmentStatus = segmentStatus.concat(new Array(newSegs.length).fill('waiting'));
+      buildSegmentGrid(segmentsList.length);
+      updatePipelineStep('downloading', `Step 1: Downloading Segments (${segmentsList.length})`);
+
+      // Dispatch worker threads to download remaining segments in parallel
+      for (let i = 0; i < concurrency; i++) {
+        workerLoop();
+      }
+    }
+  }
+
+  function queueNextDynamicSegment(url, nextOffset, isAudio = false) {
+    isDynamicStreaming = true;
+    const CHUNK_SIZE = 1048576;
+    const end = nextOffset + CHUNK_SIZE - 1;
+    const idx = segmentsList.length;
+
+    segmentsList.push({
+      url: url,
+      range: `bytes=${nextOffset}-${end}`,
+      start: nextOffset,
+      end: end,
+      size: CHUNK_SIZE,
+      isAudio: isAudio,
+      isDynamicStream: true,
+      index: idx
+    });
+
+    downloadedBuffers.push(null);
+    segmentStatus.push('waiting');
+    buildSegmentGrid(segmentsList.length);
+    updatePipelineStep('downloading', `Step 1: Downloading Segments (${segmentsList.length})`);
+
+    workerLoop();
+  }
+
+  async function setupDirectOrChunkedDownload(rawUrl, rawAudioUrl, title) {
+    const cleanUrl = cleanStreamUrl(rawUrl);
+    const cleanAudio = rawAudioUrl ? cleanStreamUrl(rawAudioUrl) : '';
+    streamUrl = cleanUrl;
+    audioUrl = cleanAudio;
+
+    let isAudio = isAudioStream(cleanUrl, streamType, streamFormat);
+
+    setStatus('Probing Stream Segments...');
+    let totalSize = 0;
+    let audioTotalSize = 0;
+
+    // 1. Probe via background service worker (with <all_urls> permission, bypasses CORS)
+    try {
+      const probeRes = await new Promise((resolve) => {
+        chrome.runtime.sendMessage(
+          { action: 'probeMedia', url: cleanUrl, audioUrl: cleanAudio },
+          (resp) => {
+            if (chrome.runtime.lastError || !resp || !resp.success) {
+              resolve(null);
+            } else {
+              resolve(resp);
+            }
+          }
+        );
+      });
+
+      if (probeRes) {
+        if (probeRes.totalSize && probeRes.totalSize > 65536) {
+          totalSize = probeRes.totalSize;
+        }
+        if (probeRes.audioTotalSize && probeRes.audioTotalSize > 65536) {
+          audioTotalSize = probeRes.audioTotalSize;
+        }
+        if (probeRes.mimeType) {
+          if (probeRes.mimeType.includes('audio')) {
+            isAudio = true;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('Background probe note:', e);
+    }
+
+    // 2. Check clen parameter in URL (YouTube video & audio streams)
     if (!totalSize) {
       try {
-        const headRes = await fetch(url, { method: 'HEAD' });
-        const cl = headRes.headers.get('content-length');
-        if (cl) totalSize = parseInt(cl, 10);
+        const u = new URL(cleanUrl);
+        const clen = u.searchParams.get('clen');
+        if (clen && parseInt(clen, 10) > 65536) totalSize = parseInt(clen, 10);
       } catch {}
     }
 
+    // 3. Check query param 'size' passed from detector
+    if (!totalSize) {
+      const pSize = params.get('size');
+      if (pSize && parseInt(pSize, 10) > 65536) totalSize = parseInt(pSize, 10);
+    }
+
+    // 4. Local range probe
     if (!totalSize) {
       try {
-        const rangeRes = await fetch(url, { headers: { 'Range': 'bytes=0-1' } });
+        let probeUrl = cleanUrl;
+        if (probeUrl.includes('googlevideo.com') || probeUrl.includes('videoplayback')) {
+          const u = new URL(probeUrl);
+          u.searchParams.set('range', '0-1');
+          probeUrl = u.href;
+        }
+        const rangeRes = await fetch(probeUrl, { headers: { 'Range': 'bytes=0-1' } });
         const cr = rangeRes.headers.get('content-range');
         if (cr) {
           const m = cr.match(/\/(\d+)$/);
-          if (m) totalSize = parseInt(m[1], 10);
+          if (m && parseInt(m[1], 10) > 65536) totalSize = parseInt(m[1], 10);
         }
-      } catch {}
+        if (!totalSize) {
+          const cl = rangeRes.headers.get('content-length');
+          if (cl && parseInt(cl, 10) > 65536) totalSize = parseInt(cl, 10);
+        }
+      } catch (e) {
+        console.warn('Range probe note:', e);
+      }
+    }
+
+    // 5. Try HEAD request
+    if (!totalSize) {
+      try {
+        const headRes = await fetch(cleanUrl, { method: 'HEAD' });
+        const cl = headRes.headers.get('content-length');
+        if (cl && parseInt(cl, 10) > 65536) totalSize = parseInt(cl, 10);
+      } catch (e) {}
     }
 
     expectedTotalBytes = totalSize || 0;
-    const CHUNK_SIZE = 1572864; // 1.5 MB segments
+    // For smaller media like songs (<= 4MB), use 512KB chunks; for larger videos use 1MB chunks
+    const CHUNK_SIZE = (totalSize && totalSize <= 4 * 1048576) ? 524288 : 1048576;
     let segs = [];
 
-    if (totalSize && totalSize > 0) {
+    if (totalSize && totalSize > 65536) {
+      isDynamicStreaming = false;
       let offset = 0;
       while (offset < totalSize) {
         const end = Math.min(offset + CHUNK_SIZE - 1, totalSize - 1);
         segs.push({
-          url,
+          url: cleanUrl,
           range: `bytes=${offset}-${end}`,
           start: offset,
-          end,
+          end: end,
           size: end - offset + 1,
-          isAudio: false
+          isAudio: isAudio
         });
         offset = end + 1;
       }
     } else {
-      // Unknown size: single stream chunk
-      segs.push({ url, isAudio: false });
+      // Dynamic chunk probing: start with initial chunk.
+      // Dynamic streaming continues fetching chunk by chunk until EOF.
+      isDynamicStreaming = true;
+      isStreamEofReached = false;
+      segs.push({
+        url: cleanUrl,
+        range: `bytes=0-${CHUNK_SIZE - 1}`,
+        start: 0,
+        end: CHUNK_SIZE - 1,
+        size: CHUNK_SIZE,
+        isAudio: isAudio,
+        isDynamicProbe: true,
+        isDynamicStream: true
+      });
     }
 
-    // Audio stream chunks (for YouTube or separate audio tracks)
-    if (audioTrackUrl && audioTrackUrl !== url) {
-      let audioTotalSize = 0;
-      try {
-        const au = new URL(audioTrackUrl);
-        const aClen = au.searchParams.get('clen');
-        if (aClen) audioTotalSize = parseInt(aClen, 10);
-      } catch {}
+    // Separate audio stream chunks (for YouTube video + audio)
+    if (cleanAudio && cleanAudio !== cleanUrl && !isAudio) {
+      if (!audioTotalSize) {
+        try {
+          const au = new URL(cleanAudio);
+          const aClen = au.searchParams.get('clen');
+          if (aClen && parseInt(aClen, 10) > 65536) audioTotalSize = parseInt(aClen, 10);
+        } catch {}
+      }
 
       if (!audioTotalSize) {
         try {
-          const aRangeRes = await fetch(audioTrackUrl, { headers: { 'Range': 'bytes=0-1' } });
+          const aRangeRes = await fetch(cleanAudio, { headers: { 'Range': 'bytes=0-1' } });
           const cr = aRangeRes.headers.get('content-range');
           if (cr) {
             const m = cr.match(/\/(\d+)$/);
-            if (m) audioTotalSize = parseInt(m[1], 10);
+            if (m && parseInt(m[1], 10) > 65536) audioTotalSize = parseInt(m[1], 10);
           }
         } catch {}
       }
@@ -453,7 +619,7 @@
         while (aOffset < audioTotalSize) {
           const aEnd = Math.min(aOffset + CHUNK_SIZE - 1, audioTotalSize - 1);
           segs.push({
-            url: audioTrackUrl,
+            url: cleanAudio,
             range: `bytes=${aOffset}-${aEnd}`,
             start: aOffset,
             end: aEnd,
@@ -472,7 +638,7 @@
     totalBytes = 0;
 
     buildSegmentGrid(segmentsList.length);
-    setStatus('Caching');
+    setStatus('Downloading Segments...');
     startDownload();
   }
 
@@ -488,19 +654,44 @@
         if (seg.range) {
           fetchOptions.headers = { 'Range': seg.range };
         }
-        let fetchUrl = seg.url;
+        let fetchUrl = cleanStreamUrl(seg.url);
 
-        // If YouTube videoplayback, also set range param in query if supported
-        if (seg.start !== undefined && seg.end !== undefined && fetchUrl.includes('videoplayback')) {
+        // If YouTube / googlevideo videoplayback, range MUST be specified in query params
+        if (seg.start !== undefined && seg.end !== undefined) {
           try {
             const u = new URL(fetchUrl);
-            u.searchParams.set('range', `${seg.start}-${seg.end}`);
-            fetchUrl = u.href;
+            if (u.hostname.includes('googlevideo.com') || u.pathname.includes('videoplayback')) {
+              u.searchParams.set('range', `${seg.start}-${seg.end}`);
+              fetchUrl = u.href;
+            }
           } catch {}
         }
 
         const res = await fetch(fetchUrl, fetchOptions);
-        if (!res.ok && res.status !== 206) throw new Error(`HTTP ${res.status}`);
+
+        // If EOF reached on dynamic range
+        if (res.status === 416) {
+          return new ArrayBuffer(0);
+        }
+
+        if (!res.ok && res.status !== 206) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+
+        // On dynamic probe, check Content-Range to expand all remaining segments
+        if (seg.isDynamicProbe) {
+          const cr = res.headers.get('content-range');
+          if (cr) {
+            const m = cr.match(/\/(\d+)$/);
+            if (m) {
+              const fullSize = parseInt(m[1], 10);
+              if (fullSize > seg.size) {
+                expandRemainingSegments(seg.url, fullSize, seg.size, seg.isAudio);
+              }
+            }
+          }
+        }
+
         let buf = await res.arrayBuffer();
 
         if (seg.encryption && seg.encryption.method === 'AES-128') {
@@ -517,29 +708,87 @@
     throw lastErr;
   }
 
-  async function workerLoop() {
-    while (!isCancelled && !isPaused && nextSegmentIndex < segmentsList.length) {
-      const idx = nextSegmentIndex++;
-      const seg = segmentsList[idx];
+  function checkCompletion() {
+    if (!isDownloading || isCancelled || isPaused) return;
 
-      segmentStatus[idx] = 'active';
-      updateSegmentBlock(idx, 'active');
+    const total = segmentsList.length;
+    const completed = segmentStatus.filter(s => s === 'done').length;
 
-      try {
-        const buf = await downloadSegmentWithRetry(seg);
-        if (isCancelled) return;
+    // If dynamic stream is active, do not finish while workers are still running
+    if (isDynamicStreaming && !isStreamEofReached) {
+      return;
+    }
 
-        downloadedBuffers[idx] = buf;
-        segmentStatus[idx] = 'done';
-        updateSegmentBlock(idx, 'done');
-        totalBytes += buf ? buf.byteLength : 0;
-      } catch (err) {
-        console.error(`Segment ${idx} failed:`, err);
-        segmentStatus[idx] = 'error';
-        updateSegmentBlock(idx, 'error');
+    // Safety check: a song or video file is NEVER less than 100 KB unless EOF was verified.
+    // If it stopped at 6.4 KB, it only fetched the init header chunk!
+    if (totalBytes < 100000 && !isStreamEofReached) {
+      if (!isCancelled && !isPaused && segmentsList.length > 0) {
+        const lastSeg = segmentsList[segmentsList.length - 1];
+        const lastBufLen = downloadedBuffers[lastSeg.index]?.byteLength || 0;
+        const nextStart = lastSeg.start + lastBufLen;
+        console.warn('File size < 100KB, queueing continuation chunk from byte:', nextStart);
+        isDynamicStreaming = true;
+        queueNextDynamicSegment(streamUrl, nextStart, isAudioStream(streamUrl, streamType, streamFormat));
+        return;
       }
+    }
 
-      updateProgress();
+    if (completed === total && total > 0 && activeWorkers === 0) {
+      finishDownload();
+    }
+  }
+
+  async function workerLoop() {
+    activeWorkers++;
+    try {
+      while (!isCancelled && !isPaused && nextSegmentIndex < segmentsList.length) {
+        const idx = nextSegmentIndex++;
+        const seg = segmentsList[idx];
+
+        segmentStatus[idx] = 'active';
+        updateSegmentBlock(idx, 'active');
+
+        try {
+          const buf = await downloadSegmentWithRetry(seg);
+          if (isCancelled) return;
+
+          // If EOF reached on dynamic chunk
+          if (buf && buf.byteLength === 0 && seg.isDynamicStream) {
+            isStreamEofReached = true;
+            isDynamicStreaming = false;
+            segmentStatus[idx] = 'done';
+            updateSegmentBlock(idx, 'done');
+            updateProgress();
+            continue;
+          }
+
+          downloadedBuffers[idx] = buf;
+          segmentStatus[idx] = 'done';
+          updateSegmentBlock(idx, 'done');
+          const chunkLen = buf ? buf.byteLength : 0;
+          totalBytes += chunkLen;
+
+          // If dynamic stream without known total size, keep queueing next segment as long as chunks return data
+          if (seg.isDynamicStream && isDynamicStreaming && !isStreamEofReached) {
+            if (chunkLen > 0) {
+              const nextStart = seg.start + chunkLen;
+              queueNextDynamicSegment(seg.url, nextStart, seg.isAudio);
+            } else {
+              isStreamEofReached = true;
+              isDynamicStreaming = false;
+            }
+          }
+        } catch (err) {
+          console.error(`Segment ${idx} failed:`, err);
+          segmentStatus[idx] = 'error';
+          updateSegmentBlock(idx, 'error');
+        }
+
+        updateProgress();
+      }
+    } finally {
+      activeWorkers--;
+      checkCompletion();
     }
   }
 
@@ -571,9 +820,7 @@
     // Explicit segment count and progress display
     cachingStats.textContent = `Segments: ${completed} / ${total} (${percent.toFixed(1)}%), Size: ${formatBytes(totalBytes)}, Speed: ${formatSpeed(currentSpeed)}, Time left: ${timeLeftStr}, Retries: ${retryCount}, Threads: ${concurrency}`;
 
-    if (completed === total && total > 0 && isDownloading) {
-      finishDownload();
-    }
+    checkCompletion();
   }
 
   function startSpeedMonitor() {
@@ -665,13 +912,13 @@
     setStatus('All Segments Downloaded! Merging...', true);
     updatePipelineStep('merging', 'Step 2: Merging Segments');
 
-    cachingStats.textContent = `All ${segmentsList.length} segments downloaded (${formatBytes(totalBytes)}). Merging all segments into single video file...`;
-    showNotice(`All ${segmentsList.length} segments downloaded! Merging all segments into actual video file...`, 'success');
+    cachingStats.textContent = `All ${segmentsList.length} segments downloaded (${formatBytes(totalBytes)}). Merging all segments into single file...`;
+    showNotice(`All ${segmentsList.length} segments downloaded! Merging all segments into actual file...`, 'success');
 
     // Give visual indication of merging phase
     await new Promise(r => setTimeout(r, 600));
 
-    // 2. Merge all segments & download the actual video file
+    // 2. Merge all segments & download the actual video/song file
     await mergeAndDownloadActualVideo();
   }
 
@@ -684,7 +931,7 @@
 
     segmentsList.forEach((seg, idx) => {
       const buf = downloadedBuffers[idx];
-      if (!buf) return;
+      if (!buf || buf.byteLength === 0) return;
       if (seg.isAudio) {
         validAudioBuffers.push(buf);
       } else {
@@ -697,13 +944,23 @@
       return;
     }
 
-    cachingStats.textContent = `Merging ${validVideoBuffers.length} video segments + ${validAudioBuffers.length} audio segments into final video...`;
+    const isAudio = isAudioStream(streamUrl, streamType, streamFormat);
+
+    cachingStats.textContent = isAudio ?
+      `Merging ${validAudioBuffers.length || validVideoBuffers.length} audio segments into complete song...` :
+      `Merging ${validVideoBuffers.length} video segments + ${validAudioBuffers.length} audio segments into final video...`;
     await new Promise(r => setTimeout(r, 400));
 
     let finalBlob;
     let ext = 'mp4';
+    let mimeType = 'video/mp4';
 
-    if (streamType === 'hls' || streamType === 'm3u8' || streamType === 'ts') {
+    if (isAudio) {
+      ext = streamFormat === 'mp3' ? 'mp3' : (streamUrl.includes('webm') || streamFormat === 'webm' ? 'webm' : 'm4a');
+      mimeType = ext === 'mp3' ? 'audio/mpeg' : (ext === 'webm' ? 'audio/webm' : 'audio/mp4');
+      const allBufs = validAudioBuffers.concat(validVideoBuffers);
+      finalBlob = new Blob(allBufs, { type: mimeType });
+    } else if (streamType === 'hls' || streamType === 'm3u8' || streamType === 'ts') {
       const mergedList = [];
       const maxLen = Math.max(validVideoBuffers.length, validAudioBuffers.length);
       for (let i = 0; i < maxLen; i++) {
@@ -726,16 +983,19 @@
       finalBlob = new Blob(allBufs, { type: isWebm ? 'video/webm' : 'video/mp4' });
     }
 
-    // 3. Merging complete -> Download actual video!
-    setStatus('Merged & Downloading Video!', false);
-    updatePipelineStep('completed', 'Step 3: Actual Video Downloaded');
+    // 3. Merging complete -> Download actual song / video!
+    setStatus('Merged & Downloading!', false);
+    updatePipelineStep('completed', 'Step 3: Actual File Downloaded');
 
     let cleanName = (filenameInput.value.trim() || originalTitle).replace(/[\\/:*?"<>|]/g, '_');
+    if (isAudio && cleanName.endsWith('.mp4')) {
+      cleanName = cleanName.slice(0, -4);
+    }
     if (!cleanName.endsWith(`.${ext}`)) {
       cleanName = `${cleanName}.${ext}`;
     }
 
-    // Trigger browser download of actual merged video
+    // Trigger browser download of actual merged file
     const blobUrl = URL.createObjectURL(finalBlob);
     const a = document.createElement('a');
     a.href = blobUrl;
@@ -746,8 +1006,9 @@
 
     setTimeout(() => URL.revokeObjectURL(blobUrl), 120000);
 
-    cachingStats.textContent = `✅ Merged ${segmentsList.length} segments successfully! Actual video downloaded: ${cleanName} (${formatBytes(finalBlob.size)})`;
-    showNotice(`🎉 Actual video downloaded successfully: ${cleanName} (${formatBytes(finalBlob.size)})`, 'success');
+    const typeDesc = isAudio ? 'Song / Audio' : 'Video';
+    cachingStats.textContent = `✅ Merged ${segmentsList.length} segments successfully! Actual ${typeDesc.toLowerCase()} downloaded: ${cleanName} (${formatBytes(finalBlob.size)})`;
+    showNotice(`🎉 Actual ${typeDesc.toLowerCase()} downloaded successfully: ${cleanName} (${formatBytes(finalBlob.size)})`, 'success');
   }
 
   // ---------------------------------------------------------------------------
@@ -836,8 +1097,15 @@
       safeName = 'video_download';
     }
 
-    cachingFilename.textContent = `${safeName}.mp4`;
-    filenameInput.value = safeName;
+    const isAudio = isAudioStream(streamUrl, streamType, streamFormat);
+    const defaultExt = isAudio ? (streamFormat === 'mp3' ? 'mp3' : 'm4a') : 'mp4';
+    if (fileExtLabel) fileExtLabel.textContent = `.${defaultExt}`;
+    if (!safeName.endsWith(`.${defaultExt}`) && !safeName.endsWith('.mp4') && !safeName.endsWith('.m4a') && !safeName.endsWith('.mp3')) {
+      cachingFilename.textContent = `${safeName}.${defaultExt}`;
+    } else {
+      cachingFilename.textContent = safeName;
+    }
+    filenameInput.value = safeName.replace(/\.(mp4|m4a|mp3|webm|mkv|ts)$/i, '');
 
     if (!streamUrl) {
       showNotice('No stream URL provided. Please open this page from the extension popup.', 'error');
