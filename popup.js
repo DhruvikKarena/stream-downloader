@@ -31,20 +31,21 @@
   }
 
   function extractFilename(url) {
-    if (!url) return 'Unknown file';
+    if (!url) return 'video_download.mp4';
     try {
       const parsed = new URL(url);
       const path = parsed.pathname;
       const segments = path.split('/').filter(Boolean);
       if (segments.length > 0) {
         const last = decodeURIComponent(segments[segments.length - 1]);
-        // Strip long query-like suffixes but keep the core name
         const cleaned = last.split('?')[0];
-        if (cleaned && cleaned.length > 0 && cleaned !== '/') {
+        if (cleaned && cleaned.length > 0 && cleaned !== '/' && !cleaned.startsWith('videoplayback')) {
           return cleaned.length > 60 ? cleaned.substring(0, 57) + '...' : cleaned;
         }
       }
-      // Fallback: use hostname + truncated path
+      if (parsed.pathname.includes('videoplayback')) {
+        return 'video_download.mp4';
+      }
       const fallback = parsed.hostname + parsed.pathname;
       return fallback.length > 55 ? fallback.substring(0, 52) + '...' : fallback;
     } catch {
@@ -52,28 +53,53 @@
     }
   }
 
-  function getMediaTypeLabel(type) {
-    if (!type) return 'OTHER';
-    const t = type.toLowerCase();
-    if (t === 'hls' || t === 'm3u8') return 'HLS';
-    if (t === 'dash' || t === 'mpd') return 'DASH';
-    if (t === 'mp4' || t === 'webm' || t === 'mkv' || t === 'avi' || t === 'mov') return t.toUpperCase();
-    if (t === 'audio' || t === 'mp3' || t === 'aac' || t === 'ogg' || t === 'flac' || t === 'wav' || t === 'opus') return 'AUDIO';
-    return t.toUpperCase();
+  function getSafeFilename(item) {
+    if (!item) return 'video_download.mp4';
+    let name = item.filename;
+    if (!name || name === 'videoplayback' || name.startsWith('videoplayback') || name === 'Unknown file' || name === 'media' || !name.includes('.')) {
+      const ext = item.format ? `.${item.format}` : (item.type === 'audio' ? '.m4a' : '.mp4');
+      const tag = item.resolution || item.quality || (item.type === 'audio' ? 'Audio' : 'Video');
+      const cleanTitle = (item.title || 'video').replace(/[\\/:*?"<>|]/g, '_').trim();
+      name = `${cleanTitle || 'video'} [${tag}]${ext}`;
+    }
+    return name.replace(/[\\/:*?"<>|]/g, '_').trim();
   }
 
-  function getMediaBadgeClass(type) {
-    const label = getMediaTypeLabel(type).toLowerCase();
-    if (label === 'hls') return 'hls';
-    if (label === 'dash') return 'dash';
-    if (label === 'mp4' || label === 'webm' || label === 'mkv' || label === 'avi' || label === 'mov') return 'mp4';
-    if (label === 'audio' || label === 'mp3' || label === 'aac' || label === 'ogg' || label === 'flac' || label === 'wav' || label === 'opus') return 'audio';
+  function getMediaTypeLabel(item) {
+    if (!item) return 'OTHER';
+    const type = (typeof item === 'string' ? item : item.type || '').toLowerCase();
+    const hasAudio = typeof item === 'object' ? item.hasAudio : true;
+    const isYt = item && typeof item === 'object' && item.url && (item.url.includes('googlevideo.com') || item.url.includes('videoplayback'));
+
+    if (type === 'hls' || type === 'm3u8') return 'HLS STREAM';
+    if (type === 'dash' || type === 'mpd') return 'DASH STREAM';
+    if (type === 'video') {
+      if (isYt || !hasAudio) return 'VIDEO + AUDIO (RECORDER)';
+      return hasAudio ? 'VIDEO + AUDIO' : 'VIDEO ONLY';
+    }
+    if (type === 'audio') return 'AUDIO ONLY';
+    if (type === 'mp4' || type === 'webm' || type === 'mkv' || type === 'avi' || type === 'mov') {
+      return hasAudio ? `${type.toUpperCase()} + AUDIO` : `${type.toUpperCase()} ONLY`;
+    }
+    return type.toUpperCase();
+  }
+
+  function getMediaBadgeClass(item) {
+    const type = (typeof item === 'string' ? item : item.type || '').toLowerCase();
+    const hasAudio = typeof item === 'object' ? item.hasAudio : true;
+
+    if (type === 'hls' || type === 'm3u8') return 'hls';
+    if (type === 'dash' || type === 'mpd') return 'dash';
+    if (type === 'audio') return 'audio';
+    if (type === 'video' || type === 'mp4' || type === 'webm') {
+      return hasAudio ? 'video-audio' : 'mp4';
+    }
     return 'other';
   }
 
-  function getMediaTypeBadge(type) {
-    const label = getMediaTypeLabel(type);
-    const cls = getMediaBadgeClass(type);
+  function getMediaTypeBadge(item) {
+    const label = getMediaTypeLabel(item);
+    const cls = getMediaBadgeClass(item);
     return `<span class="type-badge ${cls}">${label}</span>`;
   }
 
@@ -91,6 +117,7 @@
   function renderMediaList(mediaItems) {
     mediaListEl.innerHTML = '';
     const items = Array.isArray(mediaItems) ? mediaItems : [];
+    window._svd_mediaItems = items;
 
     mediaCountEl.textContent = items.length;
 
@@ -107,11 +134,15 @@
       card.dataset.url = item.url;
       card.dataset.index = index;
 
-      const filename = extractFilename(item.url);
+      const filename = item.filename || extractFilename(item.url);
       const sizeStr = item.size ? formatBytes(item.size) : '';
 
       // Build details line
       let detailsHTML = '';
+      if (item.resolution) {
+        detailsHTML += `<span class="media-size" style="color:#58a6ff; font-weight:600;">${escapeHtml(item.resolution)}</span>`;
+        detailsHTML += '<span class="detail-separator"></span>';
+      }
       if (sizeStr) {
         detailsHTML += `<span class="media-size">${sizeStr}</span>`;
         detailsHTML += '<span class="detail-separator"></span>';
@@ -120,7 +151,7 @@
 
       card.innerHTML = `
         <div class="media-card-top">
-          ${getMediaTypeBadge(item.type)}
+          ${getMediaTypeBadge(item)}
           <div class="media-card-info">
             <div class="media-filename" title="${escapeHtml(filename)}">${escapeHtml(filename)}</div>
             <div class="media-details">${detailsHTML}</div>
@@ -219,6 +250,9 @@
       sorted.forEach(function (stream, i) {
         const opt = document.createElement('option');
         opt.value = stream.url || '';
+        if (stream.audioUrl) {
+          opt.dataset.audioUrl = stream.audioUrl;
+        }
 
         let text = '';
         if (stream.resolution) {
@@ -233,6 +267,9 @@
           const kbps = Math.round(stream.bandwidth / 1000);
           text += ' \u2014 ' + kbps + 'kbps';
         }
+        if (stream.audioUrl) {
+          text += ' (with Audio)';
+        }
         opt.textContent = text;
         if (i === 0) opt.selected = true;
         select.appendChild(opt);
@@ -243,74 +280,45 @@
     });
   }
 
-  // ───────── Download Handling ─────────
+  // ───────── Download Handling (Opens in New Tab like Screenshot) ─────────
 
   function handleDownload(item, index, card) {
-    const isStream = item.type === 'hls' || item.type === 'dash' || item.type === 'm3u8' || item.type === 'mpd';
-
-    // Determine selected quality URL for HLS
+    const filename = getSafeFilename(item);
     let downloadUrl = item.url;
+    let audioUrl = item.audioUrl || '';
+
+    // If HLS quality select is present and chosen
     const qualitySelect = card.querySelector('.quality-select');
     if (qualitySelect && qualitySelect.value) {
       downloadUrl = qualitySelect.value;
+      const selOpt = qualitySelect.selectedOptions ? qualitySelect.selectedOptions[0] : null;
+      if (selOpt && selOpt.dataset.audioUrl) {
+        audioUrl = selOpt.dataset.audioUrl;
+      }
     }
 
-    // Streaming video downloads (HLS / DASH) open in the dedicated multi-threaded
-    // downloader tab to allow true multi-thread chunking, live speed display,
-    // AES decryption, and to prevent download cancellation when the popup closes.
-    if (isStream) {
-      const filename = extractFilename(item.url);
-      const dlUrl = chrome.runtime.getURL(
-        `download.html?url=${encodeURIComponent(downloadUrl)}&originalUrl=${encodeURIComponent(item.url)}&type=${encodeURIComponent(item.type)}&title=${encodeURIComponent(filename)}`
-      );
-      chrome.tabs.create({ url: dlUrl });
-      window.close();
-      return;
+    // Automatically pair video-only stream with detected audio track from the same page
+    if (!audioUrl) {
+      const allItems = window._svd_mediaItems || [];
+      const audioItem = allItems.find(m => m.type === 'audio' || (m.url && (m.url.includes('mime=audio') || m.url.includes('mime%2faudio'))));
+      if (audioItem && audioItem.url !== downloadUrl) {
+        audioUrl = audioItem.url;
+      }
     }
 
-    const dlBtn = card.querySelector('.download-btn');
-    if (dlBtn) dlBtn.disabled = true;
+    // Open CocoCut-style Caching Downloader Tab in a new tab
+    let dlUrl = chrome.runtime.getURL(
+      `download.html?url=${encodeURIComponent(downloadUrl)}&originalUrl=${encodeURIComponent(item.url)}&type=${encodeURIComponent(item.type || 'video')}&title=${encodeURIComponent(filename)}`
+    );
+    if (audioUrl) {
+      dlUrl += `&audioUrl=${encodeURIComponent(audioUrl)}`;
+    }
+    if (item.format) {
+      dlUrl += `&format=${encodeURIComponent(item.format)}`;
+    }
 
-    // Show progress bar
-    const statusArea = card.querySelector('.status-area');
-    statusArea.classList.remove('hidden');
-    statusArea.innerHTML = `
-      <div class="progress-container">
-        <div class="progress-bar-wrapper">
-          <div class="progress-bar-fill" id="progress-fill-${index}" style="width: 0%"></div>
-        </div>
-        <div class="progress-info">
-          <span class="progress-size" id="progress-size-${index}">Starting...</span>
-          <span class="progress-speed" id="progress-speed-${index}"></span>
-          <span class="progress-percent" id="progress-pct-${index}">0%</span>
-        </div>
-      </div>
-    `;
-
-    // Hide the download button
-    if (dlBtn) dlBtn.style.display = 'none';
-
-    // Track this download
-    activeDownloads.set(item.url, { index: index, card: card, item: item });
-
-    // Send message to background for direct download
-    chrome.runtime.sendMessage({
-      action: 'startDownload',
-      url: item.url,
-      type: item.type,
-      filename: extractFilename(item.url),
-      tabId: item.tabId
-    }, function (response) {
-      if (chrome.runtime.lastError) {
-        showError(index, card, 'Failed to start download', item);
-        return;
-      }
-      if (response && response.error) {
-        showError(index, card, response.error, item);
-      } else {
-        showComplete(index, card);
-      }
-    });
+    chrome.tabs.create({ url: dlUrl });
+    window.close();
   }
 
   function updateProgress(index, card, data) {
@@ -486,6 +494,41 @@
     });
   }
 
+  // ───────── Video Player Recording Mode (CocoCut Style) ─────────
+
+  function checkVideoRecorderStatus() {
+    chrome.tabs.query({ active: true, currentWindow: true }, function (tabs) {
+      if (!tabs || tabs.length === 0) return;
+      const tabId = tabs[0].id;
+      const tabUrl = tabs[0].url || '';
+      const isVideoSite = tabUrl.includes('youtube.com') || tabUrl.includes('vimeo.com') || tabUrl.includes('twitch.tv');
+
+      const banner = document.getElementById('record-banner');
+      const recordBtn = document.getElementById('record-btn');
+      const desc = document.getElementById('rec-banner-desc');
+      if (!banner || !recordBtn) return;
+
+      if (isVideoSite || (window._svd_mediaItems && window._svd_mediaItems.length > 0)) {
+        banner.classList.remove('hidden');
+        recordBtn.innerHTML = '<span>⚡ Open Downloader Tab</span>';
+        if (desc) desc.textContent = 'Multi-threaded stream caching in new tab';
+      }
+    });
+  }
+
+  const recordBtn = document.getElementById('record-btn');
+  if (recordBtn) {
+    recordBtn.addEventListener('click', function () {
+      const items = window._svd_mediaItems || [];
+      if (items.length > 0) {
+        handleDownload(items[0], 0, document.body);
+      } else {
+        chrome.tabs.create({ url: chrome.runtime.getURL('download.html') });
+        window.close();
+      }
+    });
+  }
+
   // ───────── Event Handlers ─────────
 
   refreshBtn.addEventListener('click', function () {
@@ -498,6 +541,7 @@
       }, 500);
     }
     loadMedia();
+    checkVideoRecorderStatus();
   });
 
   if (openDownloaderBtn) {
@@ -516,4 +560,5 @@
   // ───────── Init ─────────
 
   loadMedia();
+  checkVideoRecorderStatus();
 })();

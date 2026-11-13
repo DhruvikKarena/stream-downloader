@@ -34,14 +34,30 @@
   const postedUrls = new Set();
 
   // -------------------------------------------------------------------
-  // 2. Post a detected URL to the content script
+  // 2. Safe string conversion & posting detected URLs
   // -------------------------------------------------------------------
 
-  function postDetected(url, source) {
-    if (!url || typeof url !== 'string') return;
+  function toCleanString(val) {
+    if (val == null) return '';
+    if (typeof val === 'string') return val;
+    if (typeof val.href === 'string') return val.href;
+    if (typeof val.baseVal === 'string') return val.baseVal;
+    if (typeof val.animVal === 'string') return val.animVal;
+    if (typeof val.url === 'string') return val.url;
+    try {
+      const s = String(val);
+      return (s === '[object Object]' || s === '[object HTMLMediaElement]') ? '' : s;
+    } catch {
+      return '';
+    }
+  }
 
-    const trimmed = url.trim();
-    if (!trimmed || trimmed.startsWith('data:') || trimmed.startsWith('blob:')) return;
+  function postDetected(url, source, mediaType, size = 0, meta = {}) {
+    const rawUrl = toCleanString(url);
+    if (!rawUrl) return;
+
+    const trimmed = rawUrl.trim();
+    if (!trimmed || trimmed.startsWith('data:') || trimmed.startsWith('blob:') || trimmed.startsWith('javascript:')) return;
 
     // Resolve against page location.
     let absolute;
@@ -58,17 +74,27 @@
       type: MSG_TYPE,
       url: absolute,
       source: source || 'inject',
+      mediaType: mediaType || undefined,
+      size: size || undefined,
+      meta: meta || undefined
     }, '*');
   }
 
   /** Quick test: does this URL look like a media resource? */
   function isMediaUrl(url) {
-    if (!url || typeof url !== 'string') return false;
+    const rawUrl = toCleanString(url);
+    if (!rawUrl) return false;
+    const lower = rawUrl.toLowerCase();
+    if (lower.includes('googlevideo.com/videoplayback') || lower.includes('/videoplayback')) return true;
+    if (lower.includes('.m3u8') || lower.includes('.mpd')) return true;
+    if (lower.includes('mime=video') || lower.includes('mime=audio')) return true;
+    if (lower.includes('mime%2fvideo') || lower.includes('mime%2faudio')) return true;
+
     try {
-      const pathname = new URL(url, location.href).pathname;
+      const pathname = new URL(rawUrl, location.href).pathname;
       return MEDIA_EXT_RE.test(pathname);
     } catch {
-      return MEDIA_EXT_RE.test(url);
+      return MEDIA_EXT_RE.test(rawUrl);
     }
   }
 
@@ -80,24 +106,36 @@
   const OrigXHRSend = XMLHttpRequest.prototype.send;
 
   XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-    // Store the URL so we can inspect it later in send().
-    this._svd_url = url;
+    const urlStr = toCleanString(url);
+    this._svd_url = urlStr || url;
 
-    if (isMediaUrl(url)) {
-      postDetected(url, 'xhr');
+    if (urlStr && isMediaUrl(urlStr)) {
+      let detectedType = undefined;
+      const lower = urlStr.toLowerCase();
+      if (lower.includes('mime=video') || lower.includes('mime%2fvideo')) {
+        detectedType = 'video';
+      } else if (lower.includes('mime=audio') || lower.includes('mime%2faudio')) {
+        detectedType = 'audio';
+      }
+      postDetected(urlStr, 'xhr', detectedType);
     }
 
     return OrigXHROpen.call(this, method, url, ...rest);
   };
 
   XMLHttpRequest.prototype.send = function (...args) {
-    // Also listen for the response to detect media served with media
-    // Content-Type but a generic URL.
     this.addEventListener('load', function onLoad() {
       try {
         const ct = (this.getResponseHeader('content-type') || '').toLowerCase();
+        const cl = parseInt(this.getResponseHeader('content-length') || '0', 10);
         if (MEDIA_CONTENT_TYPES.some(t => ct.includes(t))) {
-          postDetected(this._svd_url || this.responseURL, 'xhr-ct');
+          const isVideo = ct.startsWith('video/') || ct.includes('video/mp4') || ct.includes('video/webm');
+          const isAudio = ct.startsWith('audio/') || ct.includes('audio/mp4') || ct.includes('audio/webm');
+          const mediaType = isVideo ? 'video' : (isAudio ? 'audio' : undefined);
+          const target = toCleanString(this._svd_url || this.responseURL);
+          if (target) {
+            postDetected(target, 'xhr-ct', mediaType, cl);
+          }
         }
       } catch { /* cross-origin or network error — ignore */ }
     }, { once: true });
@@ -112,33 +150,101 @@
   const OrigFetch = window.fetch;
 
   window.fetch = function (input, init) {
-    let url;
+    let url = '';
     if (typeof input === 'string') {
       url = input;
-    } else if (input instanceof Request) {
+    } else if (input && typeof input.url === 'string') {
       url = input.url;
-    } else if (input instanceof URL) {
+    } else if (input && typeof input.href === 'string') {
       url = input.href;
+    } else {
+      url = toCleanString(input);
     }
 
     if (url && isMediaUrl(url)) {
-      postDetected(url, 'fetch');
+      let detectedType = undefined;
+      const lower = url.toLowerCase();
+      if (lower.includes('mime=video') || lower.includes('mime%2fvideo')) {
+        detectedType = 'video';
+      } else if (lower.includes('mime=audio') || lower.includes('mime%2faudio')) {
+        detectedType = 'audio';
+      }
+      postDetected(url, 'fetch', detectedType);
     }
 
-    // Call the original and also inspect the response content-type.
     const promise = OrigFetch.call(this, input, init);
 
     promise.then(response => {
       try {
         const ct = (response.headers.get('content-type') || '').toLowerCase();
+        const cl = parseInt(response.headers.get('content-length') || '0', 10);
         if (MEDIA_CONTENT_TYPES.some(t => ct.includes(t))) {
-          postDetected(url || response.url, 'fetch-ct');
+          const isVideo = ct.startsWith('video/') || ct.includes('video/mp4') || ct.includes('video/webm');
+          const isAudio = ct.startsWith('audio/') || ct.includes('audio/mp4') || ct.includes('audio/webm');
+          const mediaType = isVideo ? 'video' : (isAudio ? 'audio' : undefined);
+          const target = toCleanString(url || response.url);
+          if (target) {
+            postDetected(target, 'fetch-ct', mediaType, cl);
+          }
         }
       } catch { /* ignore */ }
     }).catch(() => { /* network error — ignore */ });
 
     return promise;
   };
+
+  // -------------------------------------------------------------------
+  // 4.1 Scan YouTube Player Data (Direct streams with title & video+audio)
+  // -------------------------------------------------------------------
+
+  function scanYouTubePlayerData() {
+    try {
+      const pr = window.ytInitialPlayerResponse ||
+                 (window.ytplayer && window.ytplayer.config && window.ytplayer.config.args && window.ytplayer.config.args.raw_player_response);
+      if (!pr || !pr.streamingData) return;
+
+      const title = pr.videoDetails ? pr.videoDetails.title : document.title.replace(/\s*-\s*YouTube$/i, '');
+      const formats = pr.streamingData.formats || [];
+      const adaptive = pr.streamingData.adaptiveFormats || [];
+
+      // formats: streams that contain BOTH video AND audio together (360p, 720p MP4)
+      for (const f of formats) {
+        if (f.url) {
+          postDetected(f.url, 'youtube-player', 'video', f.contentLength, {
+            title: `${title} [${f.qualityLabel || '720p'} Video+Audio]`,
+            hasAudio: true,
+            resolution: f.qualityLabel || '720p',
+            format: 'mp4'
+          });
+        }
+      }
+
+      // adaptiveFormats: separate high-res video (1080p, 4K) & audio tracks
+      for (const f of adaptive) {
+        if (f.url) {
+          const isVideo = (f.mimeType || '').startsWith('video/');
+          const isAudio = (f.mimeType || '').startsWith('audio/');
+          const label = isVideo ? (f.qualityLabel || 'Video') : (f.audioQuality ? f.audioQuality.replace('AUDIO_QUALITY_', '') : 'Audio');
+          postDetected(f.url, 'youtube-player', isVideo ? 'video' : (isAudio ? 'audio' : 'video'), f.contentLength, {
+            title: `${title} [${label}]`,
+            hasAudio: false,
+            resolution: isVideo ? f.qualityLabel : '',
+            quality: isAudio ? `${Math.round((f.bitrate || 128000) / 1000)} kbps` : '',
+            format: isVideo ? ((f.mimeType || '').includes('webm') ? 'webm' : 'mp4') : ((f.mimeType || '').includes('webm') ? 'webm' : 'm4a')
+          });
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  // Scan YouTube player data periodically and on navigation
+  if (location.hostname.includes('youtube.com')) {
+    window.addEventListener('yt-navigate-finish', () => setTimeout(scanYouTubePlayerData, 1000));
+    window.addEventListener('DOMContentLoaded', () => setTimeout(scanYouTubePlayerData, 1500));
+    setInterval(scanYouTubePlayerData, 3000);
+  }
 
   // -------------------------------------------------------------------
   // 5. Intercept HTMLMediaElement.prototype.src setter
@@ -153,8 +259,9 @@
       enumerable: true,
       get: origSrcDescriptor.get,
       set(value) {
-        if (value && isMediaUrl(value)) {
-          postDetected(value, 'media-src');
+        const valStr = toCleanString(value);
+        if (valStr && isMediaUrl(valStr)) {
+          postDetected(valStr, 'media-src');
         }
         return origSrcDescriptor.set.call(this, value);
       },
@@ -171,8 +278,9 @@
       enumerable: true,
       get: origSourceSrcDesc.get,
       set(value) {
-        if (value && isMediaUrl(value)) {
-          postDetected(value, 'source-src');
+        const valStr = toCleanString(value);
+        if (valStr && isMediaUrl(valStr)) {
+          postDetected(valStr, 'source-src');
         }
         return origSourceSrcDesc.set.call(this, value);
       },
@@ -229,11 +337,14 @@
   const origSetAttribute = Element.prototype.setAttribute;
 
   Element.prototype.setAttribute = function (name, value) {
-    if ((name === 'src' || name === 'href') && value && isMediaUrl(value)) {
-      const tag = this.tagName;
-      if (tag === 'VIDEO' || tag === 'AUDIO' || tag === 'SOURCE' ||
-          tag === 'A' || tag === 'EMBED') {
-        postDetected(value, 'setAttribute');
+    if (name === 'src' || name === 'href') {
+      const valStr = toCleanString(value);
+      if (valStr && isMediaUrl(valStr)) {
+        const tag = this.tagName;
+        if (tag === 'VIDEO' || tag === 'AUDIO' || tag === 'SOURCE' ||
+            tag === 'A' || tag === 'EMBED') {
+          postDetected(valStr, 'setAttribute');
+        }
       }
     }
     return origSetAttribute.call(this, name, value);
