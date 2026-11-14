@@ -874,6 +874,15 @@ segment_2.ts
     assert.strictEqual(mergedTs.byteLength, 188 * 4, 'Merged TS has full byte length');
   });
 
+  it('Content Security Policy: manifest.json includes wasm-unsafe-eval for FFmpeg WebAssembly instantiation', () => {
+    const fs = require('fs');
+    const manifest = JSON.parse(fs.readFileSync('manifest.json', 'utf8'));
+    assert.ok(manifest.content_security_policy, 'manifest.json must declare content_security_policy');
+    assert.ok(manifest.content_security_policy.extension_pages, 'extension_pages CSP must be declared');
+    const epCsp = manifest.content_security_policy.extension_pages;
+    assert.ok(epCsp.includes("'wasm-unsafe-eval'"), "extension_pages CSP must include 'wasm-unsafe-eval' for WebAssembly compilation");
+  });
+
   console.log(`\n========================================`);
   console.log(`Tests Complete: ${passCount} Passed, ${failCount} Failed`);
   console.log(`========================================\n`);
