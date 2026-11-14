@@ -133,6 +133,7 @@
   // ---------------------------------------------------------------------------
   const cachingBox = document.getElementById('caching-box');
   const cachingStatusLabel = document.getElementById('caching-status-label');
+  const streamProtocolBadge = document.getElementById('stream-protocol-badge');
   const cachingFilename = document.getElementById('caching-filename');
   const pipelineStepBadge = document.getElementById('pipeline-step-badge');
   const progressBarFill = document.getElementById('progress-bar-fill');
@@ -1492,8 +1493,8 @@
   }
 
   async function setupHlsStream(url) {
-    setStatus('Loading playlist...', true);
-    updatePipelineStep('loading', 'Loading Playlist');
+    setStatus('Step 1: Detecting stream & reading manifest...', true);
+    updatePipelineStep('loading', 'Step 1: Detecting Stream');
     hideAllAlertBanners();
 
     try {
@@ -1514,8 +1515,15 @@
         return;
       }
 
-      // 2. Master Playlist with variants -> Show Resolution Picker BEFORE downloading (Requirement 4)
+      // 2. Master Playlist with variants -> Show Resolution Picker BEFORE downloading
       if (parsed.type === 'master' || parsed.isMaster) {
+        if (streamProtocolBadge) {
+          streamProtocolBadge.textContent = '📡 HLS Master Stream';
+          streamProtocolBadge.className = 'stream-protocol-badge badge-hls-master';
+        }
+        if (streamTypeBadge) streamTypeBadge.textContent = 'HLS (Master)';
+        setStatus('HLS Master stream detected. Select stream rendition below...', false);
+        updatePipelineStep('ready', 'Step 1: Select HLS Rendition');
         await showResolutionPicker(parsed);
       } else {
         if (resolutionPickerCard) resolutionPickerCard.classList.add('hidden');
@@ -1550,19 +1558,33 @@
     }
 
     // -------------------------------------------------------------------------
-    // STEP 1: Calculate the total segments & duration
+    // STEP 1: Stream detected -> from that stream calculate total segments
     // -------------------------------------------------------------------------
     segmentsList = (parsed.segments || []).map((s, idx) => ({ ...s, index: idx }));
     totalSegmentsCount = segmentsList.length;
     downloadedBuffers = {};
     segmentStatus = new Array(totalSegmentsCount).fill('waiting');
 
-    console.log(`[Pipeline Step 1] Calculated total segments: ${totalSegmentsCount}, Duration: ${playlistTotalDuration}s (${formatTime(playlistTotalDuration)})`);
+    const avgSegDur = totalSegmentsCount > 0 ? (playlistTotalDuration / totalSegmentsCount).toFixed(1) : '0';
+    const hlsSubtype = parsed.isFmp4 ? 'fMP4' : 'MPEG-TS';
+    const isEncrypted = parsed.segments && parsed.segments.some(s => s.encryption && s.encryption.method === 'AES-128');
+    const encTag = isEncrypted ? ' • AES-128' : '';
+
+    // Show prominently in UI that this is an HLS stream
+    if (streamProtocolBadge) {
+      streamProtocolBadge.textContent = `📡 HLS Stream (${hlsSubtype}${encTag})`;
+      streamProtocolBadge.className = 'stream-protocol-badge badge-hls';
+    }
+    if (streamTypeBadge) {
+      streamTypeBadge.textContent = `HLS (${hlsSubtype})`;
+    }
+
+    console.log(`[Pipeline Step 1] HLS stream detected (${hlsSubtype}). Calculated total segments: ${totalSegmentsCount}, Duration: ${playlistTotalDuration}s (${formatTime(playlistTotalDuration)})`);
 
     buildSegmentGrid(totalSegmentsCount);
-    updatePipelineStep('ready', `Step 1: ${totalSegmentsCount} Segments Calculated`);
-    setStatus(`Step 1 Ready: ${totalSegmentsCount} segments (${formatTime(playlistTotalDuration)})`, false);
-    cachingStats.textContent = `Segments: 0 / ${totalSegmentsCount} (0.0%), Total Duration: ${formatTime(playlistTotalDuration)}, Ready to download.`;
+    updatePipelineStep('ready', `Step 1: HLS Stream (${totalSegmentsCount} Segments)`);
+    setStatus(`HLS Stream detected: ${totalSegmentsCount} segments calculated (${formatTime(playlistTotalDuration)}, ~${avgSegDur}s/segment)`, false);
+    cachingStats.textContent = `📡 HLS Stream: ${totalSegmentsCount} segments (${formatTime(playlistTotalDuration)} total duration, ~${avgSegDur}s/segment), Format: ${hlsSubtype}${encTag}`;
 
     // Codec Detection
     if (selectedVariant && selectedVariant.codecs && typeof CodecDetect !== 'undefined') {
@@ -1591,6 +1613,10 @@
 
   async function setupDirectChunkDownload(rawUrl, title) {
     isDirectStream = true;
+    if (streamProtocolBadge) {
+      streamProtocolBadge.textContent = 'Direct Stream';
+      streamProtocolBadge.className = 'stream-protocol-badge badge-direct';
+    }
     setStatus('Probing Media Stream...', true);
     hideNotice();
 
@@ -2450,12 +2476,44 @@
     if (fileExtLabel) fileExtLabel.textContent = `.${ext}`;
     cachingFilename.textContent = `${filenameInput.value}.${ext}`;
 
+    // -------------------------------------------------------------------------
+    // STEP 1: First detect stream (from URL params or active tab media list)
+    // -------------------------------------------------------------------------
     if (!playlistUrl) {
-      showNotice('No media URL provided. Please open this page from the extension popup.', 'error');
+      setStatus('Detecting stream from active tab...', true);
+      try {
+        if (typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.query) {
+          const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+          const activeTab = tabs && tabs[0];
+          if (activeTab && activeTab.id) {
+            const resp = await new Promise(r => chrome.runtime.sendMessage({ action: 'getMedia', tabId: activeTab.id }, r));
+            if (resp && resp.media && resp.media.length > 0) {
+              const detected = resp.media[0];
+              playlistUrl = detected.url;
+              streamType = (detected.type || 'hls').toLowerCase();
+              originalTitle = detected.title || detected.filename || 'video_download';
+              currentTabId = activeTab.id;
+              urlDisplay.value = playlistUrl;
+              streamTypeBadge.textContent = streamType.toUpperCase();
+              filenameInput.value = cleanFilename(originalTitle).replace(/\.(mp4|ts|m3u8|m4a|webm|mp3)$/i, '');
+              cachingFilename.textContent = `${filenameInput.value}.${ext}`;
+              console.log('[Pipeline Step 1] Stream auto-detected from tab:', detected);
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('Stream auto-detection query failed:', e);
+      }
+    }
+
+    if (!playlistUrl) {
+      showNotice('No media stream detected. Open a video page and select a stream from the extension popup.', 'error');
+      setStatus('No Stream Detected', false);
+      updatePipelineStep('error', 'No Stream Detected');
       return;
     }
 
-    // Initialize Request Context with full frame context & DNR replay rules (Requirement 1 & 2.C)
+    // Initialize Request Context with full frame context & DNR replay rules
     await initRequestContext(playlistUrl);
 
     const isHls = streamType === 'hls' ||
