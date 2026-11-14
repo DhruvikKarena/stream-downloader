@@ -804,7 +804,7 @@
       if (items.length > 0) {
         handleDownload(items[0], 0, document.body);
       } else {
-        chrome.tabs.create({ url: chrome.runtime.getURL('download.html') });
+        chrome.tabs.create({ url: chrome.runtime.getURL('downloader.html') });
         window.close();
       }
     });

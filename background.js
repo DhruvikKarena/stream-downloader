@@ -1223,7 +1223,7 @@ async function startDownload(request) {
   if (type === 'hls' || type === 'dash' || type === 'ts' || type === 'm3u8' || type === 'mpd') {
     try {
       const targetUrl = variantUrl || url;
-      let downloadPageUrl = `download.html?url=${encodeURIComponent(targetUrl)}&originalUrl=${encodeURIComponent(url)}&type=${encodeURIComponent(type)}&title=${encodeURIComponent(filename || filenameFromUrl(url))}`;
+      let downloadPageUrl = `downloader.html?url=${encodeURIComponent(targetUrl)}&originalUrl=${encodeURIComponent(url)}&type=${encodeURIComponent(type)}&title=${encodeURIComponent(filename || filenameFromUrl(url))}`;
       if (audioUrl) {
         downloadPageUrl += `&audioUrl=${encodeURIComponent(audioUrl)}`;
       }

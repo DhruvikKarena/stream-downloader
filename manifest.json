@@ -13,7 +13,6 @@
     "cookies",
     "scripting",
     "tabs",
-    "activeTab",
     "downloads",
     "nativeMessaging"
   ],
@@ -56,16 +55,7 @@
     {
       "resources": [
         "inject.js",
-        "frame-context.js",
-        "hls-parser.js",
-        "codec-detect.js",
-        "segment-store.js",
-        "transmux.js",
-        "ffmpeg-remux.js",
-        "lib/mux.min.js",
-        "lib/ffmpeg-core.js",
-        "lib/ffmpeg-core.wasm",
-        "lib/ffmpeg-remuxer.js"
+        "lib/ffmpeg-core.wasm"
       ],
       "matches": ["<all_urls>"]
     }
