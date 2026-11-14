@@ -45,6 +45,28 @@
         </div>
       </div>
 
+      <!-- Post-Download Duration Sanity Check Banner -->
+      <div id="sanity-banner" class="alert-banner sanity-banner hidden">
+        <div class="alert-icon" id="sanity-icon">⚠️</div>
+        <div class="alert-content">
+          <strong id="sanity-title">Duration Verification</strong>
+          <p id="sanity-message"></p>
+        </div>
+      </div>
+
+      <!-- Raw TS Fallback & Manual FFmpeg Command Box -->
+      <div id="fallback-banner" class="alert-banner fallback-banner hidden">
+        <div class="alert-icon">💡</div>
+        <div class="alert-content">
+          <strong>Raw MPEG-TS Fallback Option</strong>
+          <p>You can save the raw transport stream (.ts) directly and run this lossless remux command in your terminal for instant VLC duration and seeking fix:</p>
+          <div class="command-container">
+            <code id="ffmpeg-command-display" class="command-code">ffmpeg -fflags +genpts -i in.ts -c copy -movflags +faststart out.mp4</code>
+            <button id="copy-cmd-btn" class="btn-copy-cmd" title="Copy FFmpeg Command">Copy Command</button>
+          </div>
+        </div>
+      </div>
+
       <!-- Live Stream Detection Banner (Hidden by default) -->
       <div id="live-banner" class="alert-banner live-banner hidden">
         <div class="alert-icon">🔴</div>
@@ -122,6 +144,14 @@
                 <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
               </svg>
               <span>Boost download speed</span>
+            </button>
+            <button id="save-raw-ts-btn" class="action-btn btn-fallback-ts" title="Save Raw .TS and Remux Manually (Fallback)">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="7 10 12 15 17 10"></polyline>
+                <line x1="12" y1="15" x2="12" y2="3"></line>
+              </svg>
+              <span>Save Raw .TS</span>
             </button>
           </div>
 
@@ -229,7 +259,10 @@
   </div>
 
   <!-- Local Bundled Dependencies (No CDN) -->
+  <script src="hls-parser.js"></script>
   <script src="lib/mux.min.js"></script>
+  <script src="lib/ffmpeg-core.js"></script>
+  <script src="lib/ffmpeg-remuxer.js"></script>
   <!-- Downloader Script -->
   <script src="downloader.js"></script>
 </body>

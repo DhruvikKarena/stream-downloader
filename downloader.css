@@ -782,6 +782,93 @@ body {
   background: #b71c1c;
 }
 
+/* ---------------- Fallback Banner & Sanity Banner ---------------- */
+.fallback-banner {
+  background: #fff8e1;
+  border: 1px solid #ffe082;
+  color: #5d4037;
+  padding: 14px 18px;
+  border-radius: var(--radius-md);
+  margin-bottom: 20px;
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+}
+
+.fallback-banner .alert-icon {
+  font-size: 22px;
+}
+
+.command-container {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+.command-code {
+  background: #212121;
+  color: #81c784;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+  word-break: break-all;
+  flex: 1;
+  min-width: 250px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.btn-copy-cmd {
+  background: #0288d1;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 14px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.btn-copy-cmd:hover {
+  background: #0277bd;
+  transform: translateY(-1px);
+}
+
+.sanity-banner {
+  padding: 14px 18px;
+  border-radius: var(--radius-md);
+  margin-bottom: 20px;
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+}
+
+.sanity-banner.warning {
+  background: #fff3e0;
+  border: 1px solid #ffb74d;
+  color: #e65100;
+}
+
+.sanity-banner.success {
+  background: #e8f5e9;
+  border: 1px solid #81c784;
+  color: #1b5e20;
+}
+
+.btn-fallback-ts {
+  background: #6d4c41;
+  color: #ffffff;
+}
+
+.btn-fallback-ts:hover {
+  background: #5d4037;
+  transform: translateY(-1px);
+}
+
 /* ---------------- Footer ---------------- */
 .app-footer {
   text-align: center;

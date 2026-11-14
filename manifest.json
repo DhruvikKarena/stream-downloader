@@ -42,7 +42,14 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["inject.js", "lib/mux.min.js"],
+      "resources": [
+        "inject.js",
+        "hls-parser.js",
+        "lib/mux.min.js",
+        "lib/ffmpeg-core.js",
+        "lib/ffmpeg-core.wasm",
+        "lib/ffmpeg-remuxer.js"
+      ],
       "matches": ["<all_urls>"]
     }
   ],

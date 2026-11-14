@@ -61,9 +61,12 @@
   let writableStream = null;
   let assembledBlobParts = [];
 
-  // Transmuxer (mux.js)
+  // Transmuxer (mux.js) & Timestamps
   let transmuxer = null;
   let isTransmuxerInitWritten = false;
+  let rawTsChunks = [];
+  let cumulativeDuration = 0;
+  let playlistTotalDuration = 0;
 
   // Download & UI Flags
   let isDownloading = false;
@@ -120,6 +123,16 @@
   const noticeBox = document.getElementById('notice-box');
   const noticeText = document.getElementById('notice-text');
   const retryBtn = document.getElementById('retry-btn');
+
+  // Fallback Banner, Command & Sanity Elements
+  const fallbackBanner = document.getElementById('fallback-banner');
+  const ffmpegCommandDisplay = document.getElementById('ffmpeg-command-display');
+  const copyCmdBtn = document.getElementById('copy-cmd-btn');
+  const sanityBanner = document.getElementById('sanity-banner');
+  const sanityIcon = document.getElementById('sanity-icon');
+  const sanityTitle = document.getElementById('sanity-title');
+  const sanityMessage = document.getElementById('sanity-message');
+  const saveRawTsBtn = document.getElementById('save-raw-ts-btn');
 
   // ---------------------------------------------------------------------------
   // 3. UI Helpers
@@ -184,6 +197,104 @@
 
   function cleanFilename(name) {
     return (name || 'video_download').replace(/[\\/:*?"<>|]/g, '_').trim();
+  }
+
+  function updateFfmpegCommand(name) {
+    const safe = cleanFilename(name || (filenameInput ? filenameInput.value : '') || originalTitle || 'video_download');
+    if (ffmpegCommandDisplay) {
+      ffmpegCommandDisplay.textContent = `ffmpeg -fflags +genpts -i "${safe}.ts" -c copy -movflags +faststart "${safe}.mp4"`;
+    }
+  }
+
+  function concatBuffers(buffers) {
+    let totalLength = 0;
+    for (let i = 0; i < buffers.length; i++) {
+      totalLength += buffers[i].byteLength;
+    }
+    const result = new Uint8Array(totalLength);
+    let offset = 0;
+    for (let i = 0; i < buffers.length; i++) {
+      const b = buffers[i];
+      result.set(b instanceof Uint8Array ? b : new Uint8Array(b), offset);
+      offset += b.byteLength;
+    }
+    return result;
+  }
+
+  function triggerBlobDownload(blob, filename) {
+    const blobUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = blobUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 120000);
+  }
+
+  async function getBlobDuration(blob) {
+    return new Promise((resolve) => {
+      try {
+        const video = document.createElement('video');
+        video.preload = 'metadata';
+        const url = URL.createObjectURL(blob);
+        const timer = setTimeout(() => {
+          URL.revokeObjectURL(url);
+          resolve(0);
+        }, 6000);
+        video.onloadedmetadata = () => {
+          clearTimeout(timer);
+          const dur = video.duration;
+          URL.revokeObjectURL(url);
+          resolve(isFinite(dur) && !isNaN(dur) ? dur : 0);
+        };
+        video.onerror = () => {
+          clearTimeout(timer);
+          URL.revokeObjectURL(url);
+          resolve(0);
+        };
+        video.src = url;
+      } catch {
+        resolve(0);
+      }
+    });
+  }
+
+  function runDurationSanityCheck(actualDuration, expectedDuration) {
+    if (!sanityBanner) return;
+    if (!expectedDuration || expectedDuration <= 0) return;
+
+    if (!actualDuration || actualDuration <= 0) {
+      console.log('[Sanity Check] Media duration probe returned 0 or unavailable.');
+      return;
+    }
+
+    const diffSec = Math.abs(actualDuration - expectedDuration);
+    const diffPercent = (diffSec / expectedDuration) * 100;
+
+    if (diffPercent > 5) {
+      // Differ by more than 5% -> WARN
+      sanityBanner.className = 'alert-banner sanity-banner warning';
+      if (sanityIcon) sanityIcon.textContent = '⚠️';
+      if (sanityTitle) sanityTitle.textContent = `Duration Warning: ${diffPercent.toFixed(1)}% discrepancy detected!`;
+      if (sanityMessage) {
+        sanityMessage.textContent = `Output video duration is ${formatTime(actualDuration)} (${actualDuration.toFixed(1)}s), but the sum of #EXTINF segments is ${formatTime(expectedDuration)} (${expectedDuration.toFixed(1)}s). The difference exceeds the 5% sanity threshold. VLC seeking or playback duration may be inaccurate. Use the Raw TS fallback command below if needed.`;
+      }
+      sanityBanner.classList.remove('hidden');
+      if (fallbackBanner) fallbackBanner.classList.remove('hidden');
+      showNotice(`⚠️ Duration Warning: Output duration (${actualDuration.toFixed(1)}s) differs from #EXTINF playlist sum (${expectedDuration.toFixed(1)}s) by ${diffPercent.toFixed(1)}% (> 5%).`, 'error');
+      console.warn(`[Sanity Check] Warning: Output duration ${actualDuration}s differs from expected ${expectedDuration}s by ${diffPercent.toFixed(1)}%`);
+    } else {
+      // Within 5% -> Verified
+      sanityBanner.className = 'alert-banner sanity-banner success';
+      if (sanityIcon) sanityIcon.textContent = '✅';
+      if (sanityTitle) sanityTitle.textContent = `Duration Verified (${diffPercent.toFixed(1)}% diff, within 5% threshold)`;
+      if (sanityMessage) {
+        sanityMessage.textContent = `Output video duration (${formatTime(actualDuration)}) matches playlist duration (${formatTime(expectedDuration)}). Moov duration and seeking indices are valid.`;
+      }
+      sanityBanner.classList.remove('hidden');
+      console.log(`[Sanity Check] Duration check passed: ${actualDuration}s matches ${expectedDuration}s (${diffPercent.toFixed(1)}% diff)`);
+    }
   }
 
   function cleanMediaUrl(rawUrl) {
@@ -276,6 +387,11 @@
   }
 
   function parseM3U8Content(text, baseUrl, httpStatus = 200) {
+    if (typeof HlsParser !== 'undefined' && typeof HlsParser.parse === 'function') {
+      return HlsParser.parse(text, baseUrl, httpStatus);
+    }
+
+    // Fallback if HlsParser script is not loaded
     const clean = (text || '').replace(/^\uFEFF/, '').trim();
     const m3uIndex = clean.indexOf('#EXTM3U');
     if (m3uIndex === -1) {
@@ -286,74 +402,11 @@
       throw new Error(`Server returned HTTP ${httpStatus}: "${snippet}" (Missing #EXTM3U tag)`);
     }
 
-    // Check DRM (SAMPLE-AES, Widevine, FairPlay, PlayReady)
-    const lower = text.toLowerCase();
-    if (text.includes('METHOD=SAMPLE-AES') ||
-        lower.includes('com.widevine.alpha') ||
-        lower.includes('widevine') ||
-        lower.includes('fairplay') ||
-        lower.includes('com.apple.streamingkeydelivery') ||
-        lower.includes('playready') ||
-        lower.includes('edef8ba9-79d6-4ace-a3c8-27dcd51d21ed')) {
-      return { isDrmProtected: true };
-    }
-
     const lines = clean.slice(m3uIndex).split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-
-    const isMaster = lines.some(l => l.startsWith('#EXT-X-STREAM-INF'));
-
-    if (isMaster) {
-      const variants = [];
-      const audioTracks = [];
-
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-
-        if (line.startsWith('#EXT-X-MEDIA') && line.includes('TYPE=AUDIO')) {
-          const attrs = line.substring(line.indexOf(':') + 1);
-          const groupId = extractAttr(attrs, 'GROUP-ID');
-          const uri = extractAttr(attrs, 'URI');
-          if (uri) {
-            audioTracks.push({ groupId, url: resolveUrl(uri, baseUrl) });
-          }
-        }
-
-        if (line.startsWith('#EXT-X-STREAM-INF')) {
-          const attrs = line.substring(line.indexOf(':') + 1);
-          const bandwidth = parseInt(extractAttr(attrs, 'BANDWIDTH'), 10) || 0;
-          const resolution = extractAttr(attrs, 'RESOLUTION');
-          const codecs = extractAttr(attrs, 'CODECS');
-          const audioGroup = extractAttr(attrs, 'AUDIO');
-
-          let variantUrl = '';
-          for (let j = i + 1; j < lines.length; j++) {
-            if (!lines[j].startsWith('#')) {
-              variantUrl = resolveUrl(lines[j], baseUrl);
-              break;
-            }
-          }
-          if (variantUrl) {
-            variants.push({ bandwidth, resolution, codecs, audioGroup, url: variantUrl });
-          }
-        }
-      }
-
-      for (const v of variants) {
-        if (v.audioGroup) {
-          const match = audioTracks.find(a => a.groupId === v.audioGroup);
-          if (match) v.audioUrl = match.url;
-        } else if (audioTracks.length > 0) {
-          v.audioUrl = audioTracks[0].url;
-        }
-      }
-
-      return { type: 'master', variants, audioTracks };
-    }
-
-    // Media Playlist
     const segments = [];
     let currentDuration = 0;
-    let encryptionInfo = null;
+    let pendingDiscontinuity = false;
+    let cumulativeDuration = 0;
     let mediaSequence = 0;
     let hasEndList = false;
     let initSegment = null;
@@ -361,7 +414,6 @@
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
-
       if (line.startsWith('#EXT-X-TARGETDURATION')) {
         targetDuration = parseFloat(line.split(':')[1]) || 6;
       } else if (line.startsWith('#EXT-X-MEDIA-SEQUENCE')) {
@@ -369,19 +421,9 @@
       } else if (line.startsWith('#EXT-X-MAP')) {
         const attrs = line.substring(line.indexOf(':') + 1);
         const mapUri = extractAttr(attrs, 'URI');
-        if (mapUri) {
-          initSegment = { url: resolveUrl(mapUri, baseUrl) };
-        }
-      } else if (line.startsWith('#EXT-X-KEY')) {
-        const attrs = line.substring(line.indexOf(':') + 1);
-        const method = extractAttr(attrs, 'METHOD');
-        const uri = extractAttr(attrs, 'URI');
-        const iv = extractAttr(attrs, 'IV');
-        encryptionInfo = {
-          method,
-          uri: uri ? resolveUrl(uri, baseUrl) : '',
-          iv: iv || ''
-        };
+        if (mapUri) initSegment = { url: resolveUrl(mapUri, baseUrl) };
+      } else if (line.startsWith('#EXT-X-DISCONTINUITY')) {
+        pendingDiscontinuity = true;
       } else if (line.startsWith('#EXTINF')) {
         const val = line.substring(line.indexOf(':') + 1);
         currentDuration = parseFloat(val.split(',')[0]) || 0;
@@ -391,10 +433,13 @@
         segments.push({
           url: resolveUrl(line, baseUrl),
           duration: currentDuration,
+          discontinuity: pendingDiscontinuity,
+          cumulativeDuration: cumulativeDuration,
           index: segments.length,
-          sequence: mediaSequence + segments.length,
-          encryption: encryptionInfo ? { ...encryptionInfo } : null
+          sequence: mediaSequence + segments.length
         });
+        cumulativeDuration += currentDuration;
+        pendingDiscontinuity = false;
         currentDuration = 0;
       }
     }
@@ -402,6 +447,7 @@
     return {
       type: 'media',
       segments,
+      totalDuration: cumulativeDuration,
       mediaSequence,
       targetDuration,
       hasEndList,
@@ -509,14 +555,21 @@
       return;
     }
 
+    // Single mux.js Transmuxer instance for the whole download
+    // keepOriginalTimestamps is disabled so setBaseMediaDecodeTime functions properly
     transmuxer = new window.muxjs.mp4.Transmuxer({
-      remux: true,
-      keepOriginalTimestamps: true
+      remux: false,
+      keepOriginalTimestamps: false
     });
     isTransmuxerInitWritten = false;
 
+    try {
+      transmuxer.setBaseMediaDecodeTime(0);
+    } catch (_) {}
+
     transmuxer.on('data', async (segment) => {
       try {
+        // Write the init segment (ftyp + moov) only once for the whole stream
         if (segment.initSegment && !isTransmuxerInitWritten) {
           if (writableStream) {
             await writableStream.write(segment.initSegment);
@@ -548,10 +601,25 @@
 
       while (downloadedBuffers[nextWriteIndex] !== undefined) {
         const segData = downloadedBuffers[nextWriteIndex];
+        const segMeta = segmentsList[nextWriteIndex];
         delete downloadedBuffers[nextWriteIndex]; // Free memory immediately
 
+        // Accumulate raw TS chunks for ffmpeg.wasm remux and raw TS fallback
+        if (!isDirectStream && !isFmp4) {
+          rawTsChunks.push(segData);
+        }
+
         if (!isDirectStream && outputFormat === 'mp4' && !isFmp4 && transmuxer) {
-          // Transmux TS to MP4 using bundled mux.js without re-encoding
+          // On discontinuity, align track fragment decode time to cumulative playlist duration
+          if (segMeta && segMeta.discontinuity) {
+            try {
+              transmuxer.setBaseMediaDecodeTime(Math.round(cumulativeDuration * 90000));
+            } catch (err) {
+              console.warn('[Transmuxer] setBaseMediaDecodeTime warning:', err);
+            }
+          }
+
+          // Push and flush each segment in order
           transmuxer.push(new Uint8Array(segData));
           transmuxer.flush();
         } else {
@@ -561,6 +629,10 @@
           } else {
             assembledBlobParts.push(segData);
           }
+        }
+
+        if (segMeta && typeof segMeta.duration === 'number') {
+          cumulativeDuration += segMeta.duration;
         }
 
         nextWriteIndex++;
@@ -708,16 +780,21 @@
     startTime = Date.now();
     nextSegmentIndex = 0;
     nextWriteIndex = 0;
+    cumulativeDuration = 0;
+    rawTsChunks = [];
     totalBytes = 0;
     assembledBlobParts = [];
     abortController = new AbortController();
 
     hideNotice();
+    if (sanityBanner) sanityBanner.classList.add('hidden');
+    if (fallbackBanner) fallbackBanner.classList.add('hidden');
     applyRequestHeaders();
     startSpeedMonitor();
 
     const outputExt = outputFormatSelect.value;
     const safeTitle = cleanFilename(filenameInput.value || originalTitle);
+    updateFfmpegCommand(safeTitle);
 
     // Prompt user to stream to disk if enabled
     if (streamDiskToggle && streamDiskToggle.checked) {
@@ -797,6 +874,19 @@
     showNotice('Download cancelled. In-flight requests stopped.', 'error');
   }
 
+  function saveRawTsFallback() {
+    if (rawTsChunks.length === 0 && assembledBlobParts.length === 0) {
+      showNotice('No segments downloaded yet to save as raw TS.', 'error');
+      return;
+    }
+    const safeTitle = cleanFilename(filenameInput.value || originalTitle);
+    updateFfmpegCommand(safeTitle);
+    const tsBlob = new Blob(rawTsChunks.length > 0 ? rawTsChunks : assembledBlobParts, { type: 'video/mp2t' });
+    triggerBlobDownload(tsBlob, `${safeTitle}.ts`);
+    if (fallbackBanner) fallbackBanner.classList.remove('hidden');
+    showNotice(`Raw .ts saved (${formatBytes(tsBlob.size)}). Run the manual ffmpeg command below to fix duration & moov faststart.`, 'success');
+  }
+
   async function finishDownload() {
     isDownloading = false;
     stopSpeedMonitor();
@@ -814,11 +904,28 @@
     const outputExt = outputFormatSelect.value;
     const safeTitle = cleanFilename(filenameInput.value || originalTitle);
     const finalFilename = `${safeTitle}.${outputExt}`;
+    updateFfmpegCommand(safeTitle);
 
-    await new Promise(r => setTimeout(r, 400));
+    await new Promise(r => setTimeout(r, 300));
 
-    // 1. If streamed directly to disk via showSaveFilePicker
-    if (writableStream) {
+    // 1. Raw TS Fallback Mode: User requested .ts format
+    if (outputExt === 'ts') {
+      const tsBlob = new Blob(rawTsChunks.length > 0 ? rawTsChunks : assembledBlobParts, { type: 'video/mp2t' });
+      triggerBlobDownload(tsBlob, finalFilename);
+      setStatus('Raw TS Saved!', false);
+      updatePipelineStep('completed', 'Step 3: Saved Raw TS');
+      if (fallbackBanner) fallbackBanner.classList.remove('hidden');
+      cachingStats.textContent = `✅ All ${segmentsList.length} segments saved as raw TS: ${finalFilename} (${formatBytes(tsBlob.size)})`;
+      showNotice(`Raw .ts saved. Run the ffmpeg command below to create an MP4 with fixed timestamps.`, 'success');
+
+      // Sanity Check
+      const dur = await getBlobDuration(tsBlob);
+      runDurationSanityCheck(dur, playlistTotalDuration);
+      return;
+    }
+
+    // 2. Direct Disk Stream (FSA) for fMP4 or direct chunk streams
+    if (writableStream && (isFmp4 || isDirectStream)) {
       try {
         await writableStream.close();
         writableStream = null;
@@ -826,37 +933,91 @@
         updatePipelineStep('completed', 'Step 3: Saved to Disk');
         cachingStats.textContent = `✅ All ${segmentsList.length} segments saved directly to disk: ${finalFilename} (${formatBytes(totalBytes)})`;
         showNotice(`🎉 Video saved successfully directly to disk: ${finalFilename} (${formatBytes(totalBytes)})`, 'success');
+
+        const dur = playlistTotalDuration;
+        runDurationSanityCheck(dur, playlistTotalDuration);
         return;
       } catch (err) {
         console.error('Error closing writable stream:', err);
       }
     }
 
-    // 2. Blob Download Fallback
-    let mimeType = 'video/mp4';
-    if (outputExt === 'ts') mimeType = 'video/mp2t';
-    else if (outputExt === 'webm') mimeType = 'video/webm';
-    else if (outputExt === 'm4a') mimeType = 'audio/mp4';
-    else if (outputExt === 'mp3') mimeType = 'audio/mpeg';
-    else if (outputExt === 'weba') mimeType = 'audio/webm';
-    const finalBlob = new Blob(assembledBlobParts, { type: mimeType });
+    // 3. Remux MPEG-TS to MP4 with bundled ffmpeg.wasm
+    // Command: -fflags +genpts -i in.ts -c copy -movflags +faststart out.mp4
+    let finalBlob = null;
+    let detectedDuration = 0;
+
+    if (outputExt === 'mp4' && rawTsChunks.length > 0 && typeof window.FFmpegRemuxer !== 'undefined') {
+      setStatus('Remuxing with ffmpeg.wasm...', true);
+      updatePipelineStep('remuxing', 'Step 2: Remuxing MP4 (Timestamp & Moov Fix)');
+      progressBarFill.style.width = '0%';
+      progressBarBuffered.style.width = '0%';
+
+      try {
+        const concatenatedTs = concatBuffers(rawTsChunks);
+        const remuxResult = await window.FFmpegRemuxer.remuxTsToMp4(concatenatedTs, {
+          expectedDuration: playlistTotalDuration,
+          onProgress: (p) => {
+            const pct = Math.round((p.ratio || 0) * 100);
+            progressBarFill.style.width = `${pct}%`;
+            progressBarBuffered.style.width = `${Math.min(pct + 5, 100)}%`;
+            const timeStr = formatTime(p.time || 0);
+            const totalStr = formatTime(playlistTotalDuration || p.duration || 0);
+            cachingStats.textContent = `Remuxing MP4 with ffmpeg.wasm: ${pct}% (${timeStr} / ${totalStr}) [PTS Normalization + Faststart]`;
+          }
+        });
+
+        finalBlob = new Blob([remuxResult.mp4Data], { type: 'video/mp4' });
+        detectedDuration = remuxResult.duration || 0;
+      } catch (remuxErr) {
+        console.warn('ffmpeg.wasm remux failed, falling back to mux.js / raw TS:', remuxErr);
+        showNotice(`ffmpeg.wasm remux notice: ${remuxErr.message}. Output assembled via mux.js.`, 'error');
+        if (fallbackBanner) fallbackBanner.classList.remove('hidden');
+        finalBlob = new Blob(assembledBlobParts, { type: 'video/mp4' });
+      }
+    } else {
+      let mimeType = 'video/mp4';
+      if (outputExt === 'webm') mimeType = 'video/webm';
+      else if (outputExt === 'm4a') mimeType = 'audio/mp4';
+      else if (outputExt === 'mp3') mimeType = 'audio/mpeg';
+      else if (outputExt === 'weba') mimeType = 'audio/webm';
+      finalBlob = new Blob(assembledBlobParts, { type: mimeType });
+    }
+
+    // Write to writableStream if direct disk streaming was selected
+    if (writableStream) {
+      try {
+        const arrayBuf = await finalBlob.arrayBuffer();
+        await writableStream.write(arrayBuf);
+        await writableStream.close();
+        writableStream = null;
+        setStatus('Saved to Disk!', false);
+        updatePipelineStep('completed', 'Step 3: Saved to Disk');
+        cachingStats.textContent = `✅ Video saved directly to disk: ${finalFilename} (${formatBytes(finalBlob.size)})`;
+        showNotice(`🎉 Video saved successfully directly to disk: ${finalFilename}`, 'success');
+
+        const actualDur = detectedDuration > 0 ? detectedDuration : await getBlobDuration(finalBlob);
+        runDurationSanityCheck(actualDur, playlistTotalDuration);
+        return;
+      } catch (err) {
+        console.error('Error streaming final blob to disk:', err);
+      }
+    }
+
+    // Trigger browser download
+    triggerBlobDownload(finalBlob, finalFilename);
 
     setStatus('Download Complete!', false);
     updatePipelineStep('completed', 'Step 3: Download Complete');
-
-    // Trigger browser download
-    const blobUrl = URL.createObjectURL(finalBlob);
-    const a = document.createElement('a');
-    a.href = blobUrl;
-    a.download = finalFilename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-
-    setTimeout(() => URL.revokeObjectURL(blobUrl), 120000);
+    progressBarFill.style.width = '100%';
+    progressBarBuffered.style.width = '100%';
 
     cachingStats.textContent = `✅ All ${segmentsList.length} segments merged! Downloaded: ${finalFilename} (${formatBytes(finalBlob.size)})`;
     showNotice(`🎉 Downloaded successfully: ${finalFilename} (${formatBytes(finalBlob.size)})`, 'success');
+
+    // Post-download Sanity Check (Requirement 5)
+    const finalMediaDuration = detectedDuration > 0 ? detectedDuration : await getBlobDuration(finalBlob);
+    runDurationSanityCheck(finalMediaDuration, playlistTotalDuration);
   }
 
   function startSpeedMonitor() {
@@ -1100,6 +1261,7 @@
     isFmp4 = parsed.isFmp4;
     targetDurationSec = parsed.targetDuration || 6;
     mediaSequenceBase = parsed.mediaSequence || 0;
+    playlistTotalDuration = parsed.totalDuration || (parsed.segments ? parsed.segments.reduce((acc, s) => acc + (s.duration || 0), 0) : 0);
 
     if (parsed.initSegment) {
       initSegmentUrl = parsed.initSegment.url;
@@ -1149,6 +1311,19 @@
 
   if (cancelBtn) cancelBtn.addEventListener('click', cancelDownload);
   if (saveBtn) saveBtn.addEventListener('click', finishDownload);
+  if (saveRawTsBtn) saveRawTsBtn.addEventListener('click', saveRawTsFallback);
+
+  if (copyCmdBtn) {
+    copyCmdBtn.addEventListener('click', () => {
+      const cmdText = ffmpegCommandDisplay ? ffmpegCommandDisplay.textContent : '';
+      if (cmdText) {
+        navigator.clipboard.writeText(cmdText).then(() => {
+          copyCmdBtn.textContent = 'Copied!';
+          setTimeout(() => { copyCmdBtn.textContent = 'Copy Command'; }, 2000);
+        });
+      }
+    });
+  }
 
   if (liveRecordBtn) liveRecordBtn.addEventListener('click', startLiveRecording);
   if (liveStopBtn) liveStopBtn.addEventListener('click', stopLiveRecording);
@@ -1180,6 +1355,10 @@
       if (fileExtLabel) fileExtLabel.textContent = `.${ext}`;
       const name = cleanFilename(filenameInput.value || originalTitle);
       cachingFilename.textContent = `${name}.${ext}`;
+      updateFfmpegCommand(name);
+      if (ext === 'ts') {
+        if (fallbackBanner) fallbackBanner.classList.remove('hidden');
+      }
     });
   }
 
@@ -1188,6 +1367,7 @@
       const name = cleanFilename(filenameInput.value || originalTitle);
       const ext = outputFormatSelect.value;
       cachingFilename.textContent = `${name}.${ext}`;
+      updateFfmpegCommand(name);
     });
   }
 

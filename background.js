@@ -4,6 +4,10 @@
    parses HLS/DASH manifests, and runs a multi-threaded download engine.
    =================================================================== */
 
+try {
+  importScripts('hls-parser.js');
+} catch (_) {}
+
 // ---------------------------------------------------------------------------
 // 1. Constants & Patterns
 // ---------------------------------------------------------------------------
@@ -605,6 +609,10 @@ async function parseM3U8(m3u8Url) {
  * @returns {Object}            Parsed playlist descriptor.
  */
 function parseM3U8Text(text, baseUrl, httpStatus = 200) {
+  if (typeof HlsParser !== 'undefined' && typeof HlsParser.parse === 'function') {
+    return HlsParser.parse(text, baseUrl, httpStatus);
+  }
+
   const clean = (text || '').replace(/^\uFEFF/, '').trim();
   const m3uIndex = clean.indexOf('#EXTM3U');
   if (m3uIndex === -1) {
