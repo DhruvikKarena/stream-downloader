@@ -1499,13 +1499,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const streamUrl = message.url || '';
     const customHeaders = message.customHeaders || [];
 
-    // Scope urlFilter to ||<stream host>/ (Requirement 2.C)
-    let urlFilter = '*';
-    if (streamUrl) {
-      try {
-        const u = new URL(streamUrl);
-        urlFilter = `||${u.host}/`;
-      } catch {}
+    // Collect all target hosts from message.hosts, message.urls, or message.url
+    const hosts = Array.isArray(message.hosts) && message.hosts.length > 0
+      ? message.hosts.filter(Boolean)
+      : [];
+    if (hosts.length === 0) {
+      const urlsToCheck = Array.isArray(message.urls) && message.urls.length > 0
+        ? message.urls
+        : [message.url || ''];
+      for (const u of urlsToCheck) {
+        if (!u) continue;
+        try {
+          const h = new URL(u).host;
+          if (h && !hosts.includes(h)) hosts.push(h);
+        } catch (_) {}
+      }
+    }
+    if (hosts.length === 0) {
+      hosts.push('*');
     }
 
     const requestHeaders = [];
@@ -1535,24 +1546,41 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
     }
 
+    const tabIds = [chrome.tabs.TAB_ID_NONE];
+    if (message.downloaderTabId && message.downloaderTabId !== chrome.tabs.TAB_ID_NONE) {
+      tabIds.push(message.downloaderTabId);
+    }
+
     if (chrome.declarativeNetRequest && requestHeaders.length > 0) {
-      chrome.declarativeNetRequest.updateSessionRules({
-        removeRuleIds: [ruleId],
-        addRules: [{
-          id: ruleId,
+      const removeRuleIds = [];
+      for (let i = 0; i < 10; i++) {
+        removeRuleIds.push(ruleId + i);
+      }
+
+      const addRules = [];
+      hosts.slice(0, 10).forEach((host, idx) => {
+        const currentRuleId = ruleId + idx;
+        const urlFilter = host === '*' ? '*' : `||${host}/`;
+        addRules.push({
+          id: currentRuleId,
           priority: 1,
           action: {
             type: 'modifyHeaders',
             requestHeaders
           },
           condition: {
-            // Scoped strictly to the extension's own requests (TAB_ID_NONE)
-            tabIds: [chrome.tabs.TAB_ID_NONE],
+            // Scoped strictly to the extension's own requests (TAB_ID_NONE & downloader extension tab)
+            tabIds,
             urlFilter,
             resourceTypes: ['xmlhttprequest', 'media', 'other']
           }
-        }]
-      }).then(() => sendResponse({ success: true, ruleId, urlFilter, requestHeaders }))
+        });
+      });
+
+      chrome.declarativeNetRequest.updateSessionRules({
+        removeRuleIds,
+        addRules
+      }).then(() => sendResponse({ success: true, ruleId, hosts, requestHeaders }))
         .catch(err => {
           console.warn('updateSessionRules error:', err);
           sendResponse({ success: false, error: err.message });
@@ -1565,9 +1593,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (action === 'clearDownloadHeaders') {
     const ruleId = parseInt(message.ruleId, 10) || 8888;
+    const removeRuleIds = [];
+    for (let i = 0; i < 10; i++) {
+      removeRuleIds.push(ruleId + i);
+    }
     if (chrome.declarativeNetRequest) {
       chrome.declarativeNetRequest.updateSessionRules({
-        removeRuleIds: [ruleId]
+        removeRuleIds
       }).then(() => sendResponse({ success: true }))
         .catch(err => sendResponse({ success: false, error: err.message }));
       return true;
@@ -1578,7 +1610,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (action === 'getMatchedRules') {
     if (chrome.declarativeNetRequest && chrome.declarativeNetRequest.getMatchedRules) {
-      chrome.declarativeNetRequest.getMatchedRules({ tabId: chrome.tabs.TAB_ID_NONE })
+      const tabId = message.downloaderTabId || chrome.tabs.TAB_ID_NONE;
+      chrome.declarativeNetRequest.getMatchedRules({ tabId })
         .then(res => sendResponse({ success: true, rulesMatchedInfo: res.rulesMatchedInfo || [] }))
         .catch(err => sendResponse({ success: false, error: err.message, rulesMatchedInfo: [] }));
       return true;
@@ -1727,6 +1760,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         try {
           execResult = await tryExecuteInFrame(targetFrameId, 'MAIN');
         } catch (mainErr) {
+          if (mainErr && /no tab with id/i.test(mainErr.message)) {
+            sendResponse({ success: false, error: mainErr.message, tabClosed: true });
+            return;
+          }
           console.warn(`[Frame Fetch] MAIN world execution failed in frame ${targetFrameId}:`, mainErr.message);
         }
 
@@ -1736,6 +1773,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             usedWorld = 'ISOLATED';
             execResult = await tryExecuteInFrame(targetFrameId, 'ISOLATED');
           } catch (isoErr) {
+            if (isoErr && /no tab with id/i.test(isoErr.message)) {
+              sendResponse({ success: false, error: isoErr.message, tabClosed: true });
+              return;
+            }
             console.warn(`[Frame Fetch] ISOLATED world execution failed in frame ${targetFrameId}:`, isoErr.message);
           }
         }
@@ -1804,9 +1845,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           headers: message.headers || {}
         }, options, (response) => {
           if (chrome.runtime.lastError || !response) {
+            const errMsg = chrome.runtime.lastError ? chrome.runtime.lastError.message : 'No response from frame content script';
+            const tabClosed = /no tab with id|receiving end does not exist|tab closed/i.test(errMsg);
             sendResponse({
               success: false,
-              error: chrome.runtime.lastError ? chrome.runtime.lastError.message : 'No response from frame content script'
+              error: errMsg,
+              tabClosed
             });
           } else {
             sendResponse({

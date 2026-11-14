@@ -44,6 +44,43 @@
   let workingStrategy = null; // 'same-frame' | 'content-script' | 'header-replay'
   let workingFrameId = currentFrameId;
 
+  // Stream tab lifecycle tracking (allows downloading to continue seamlessly when stream tab closes)
+  let isTabClosed = false;
+  let ownTabId = null;
+  const installedDnrHosts = new Set();
+
+  if (typeof chrome !== 'undefined' && chrome.tabs) {
+    if (chrome.tabs.getCurrent) {
+      chrome.tabs.getCurrent((tab) => {
+        if (tab && tab.id) ownTabId = tab.id;
+      });
+    }
+
+    if (currentTabId > 0 && chrome.tabs.get) {
+      chrome.tabs.get(currentTabId, (tab) => {
+        if (chrome.runtime.lastError || !tab) {
+          console.log(`[Downloader] Origin tab ${currentTabId} is closed. Standalone extension mode active.`);
+          isTabClosed = true;
+          workingStrategy = 'header-replay';
+          updateDebugActiveStrategy('header-replay (standalone)');
+        }
+      });
+    }
+
+    if (chrome.tabs.onRemoved) {
+      chrome.tabs.onRemoved.addListener((closedTabId) => {
+        if (closedTabId === currentTabId) {
+          console.log(`[Downloader] Stream tab ${closedTabId} was closed. Seamlessly continuing download via standalone extension fetch.`);
+          isTabClosed = true;
+          workingStrategy = 'header-replay';
+          updateDebugActiveStrategy('header-replay (standalone)');
+        }
+      });
+    }
+  } else {
+    isTabClosed = true;
+  }
+
   // Unique session identifier for IndexedDB & DNR rule scoping
   const sessionDownloadId = 'dl_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
   const DNR_RULE_ID = Math.floor(Math.random() * 800000) + 100000;
@@ -575,12 +612,39 @@
       debugFrameContext.textContent = redactSensitive(fInfo);
     }
 
+    if (currentTabId > 0 && typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.get) {
+      chrome.tabs.get(currentTabId, (tab) => {
+        if (chrome.runtime.lastError || !tab) {
+          console.log(`[Downloader] Origin tab ${currentTabId} is closed. Using standalone extension mode.`);
+          isTabClosed = true;
+          workingStrategy = 'header-replay';
+          updateDebugActiveStrategy('header-replay (standalone)');
+        }
+      });
+    }
+
     await applyRequestHeaders(url);
   }
 
-  async function applyRequestHeaders(url) {
+  async function applyRequestHeaders(urls) {
     try {
-      const targetUrl = url || playlistUrl;
+      const urlList = Array.isArray(urls) ? urls : [urls || playlistUrl];
+      const targetUrl = urlList[0] || playlistUrl;
+
+      // Extract unique hosts
+      const hosts = [];
+      for (const u of urlList) {
+        if (!u) continue;
+        try {
+          const h = new URL(u).host;
+          if (h && !hosts.includes(h)) hosts.push(h);
+        } catch (_) {}
+      }
+
+      // If all hosts are already configured in DNR session rules, avoid duplicate API calls
+      if (hosts.length > 0 && hosts.every(h => installedDnrHosts.has(h))) {
+        return;
+      }
 
       // Prioritize frameUrl / initiator over top-level tab URL (Requirement 1 & 2.C)
       const resolved = (typeof FrameContext !== 'undefined')
@@ -608,6 +672,9 @@
           action: 'setDownloadHeaders',
           ruleId: DNR_RULE_ID,
           url: targetUrl,
+          urls: urlList,
+          hosts,
+          downloaderTabId: ownTabId,
           frameUrl: currentFrameUrl,
           referer: resolved.referer,
           origin: resolved.origin,
@@ -615,7 +682,12 @@
           acceptLanguage: (currentRequestContext && currentRequestContext.acceptLanguage) || '',
           accept: (currentRequestContext && currentRequestContext.accept) || '',
           customHeaders: currentCustomHeaders
-        }, resolve);
+        }, (res) => {
+          if (res && res.success) {
+            hosts.forEach(h => installedDnrHosts.add(h));
+          }
+          resolve(res);
+        });
       });
 
       if (debugDnrStatus) {
@@ -628,6 +700,7 @@
 
   async function clearRequestHeaders() {
     try {
+      installedDnrHosts.clear();
       await new Promise((resolve) => {
         chrome.runtime.sendMessage({
           action: 'clearDownloadHeaders',
@@ -750,6 +823,10 @@
     const { responseType = 'text', isPlaylist = false, headers = {}, signal = abortController.signal } = options;
 
     if (strat === 'same-frame') {
+      if (isTabClosed || !currentTabId || currentTabId <= 0) {
+        return { ok: false, status: 0, error: 'Stream tab is closed' };
+      }
+
       // Strategy A: Same-frame fetch in MAIN world with fallback to ISOLATED (Requirement 2.A)
       const targetFrame = workingFrameId !== undefined ? workingFrameId : currentFrameId;
       const res = await new Promise(resolve => {
@@ -765,6 +842,14 @@
       });
 
       if (!res || !res.success || !res.result) {
+        const errMsg = res ? res.error : 'No response';
+        if ((res && res.tabClosed) || (errMsg && /no tab with id|receiving end does not exist|tab closed|not found/i.test(errMsg))) {
+          console.log('[Downloader] Stream tab closed during execution. Switching permanently to header-replay.');
+          isTabClosed = true;
+          workingStrategy = 'header-replay';
+          updateDebugActiveStrategy('header-replay (standalone)');
+        }
+
         logDiagnostic({
           strategy: 'same-frame',
           url,
@@ -774,11 +859,11 @@
           status: 0,
           statusText: 'Frame execution failed',
           contentType: '',
-          error: res ? res.error : 'No response',
+          error: errMsg,
           cacheUsed: false,
           ok: false
         });
-        return { ok: false, status: 0, error: res ? res.error : 'Execution failed' };
+        return { ok: false, status: 0, error: errMsg };
       }
 
       const pr = res.result;
@@ -890,6 +975,10 @@
     }
 
     if (strat === 'content-script') {
+      if (isTabClosed || !currentTabId || currentTabId <= 0) {
+        return { ok: false, status: 0, error: 'Stream tab is closed' };
+      }
+
       // Strategy B: Frame content-script fetch (Requirement 2.B)
       const targetFrame = workingFrameId !== undefined ? workingFrameId : currentFrameId;
       const res = await new Promise(resolve => {
@@ -904,6 +993,14 @@
       });
 
       if (!res || !res.success || !res.result) {
+        const errMsg = res ? res.error : 'No response';
+        if ((res && res.tabClosed) || (errMsg && /no tab with id|receiving end does not exist|tab closed|not found/i.test(errMsg))) {
+          console.log('[Downloader] Stream tab closed during execution. Switching permanently to header-replay.');
+          isTabClosed = true;
+          workingStrategy = 'header-replay';
+          updateDebugActiveStrategy('header-replay (standalone)');
+        }
+
         logDiagnostic({
           strategy: 'content-script',
           url,
@@ -913,11 +1010,11 @@
           status: 0,
           statusText: 'Content script unreachable',
           contentType: '',
-          error: res ? res.error : 'No response',
+          error: errMsg,
           cacheUsed: false,
           ok: false
         });
-        return { ok: false, status: 0, error: res ? res.error : 'Content script failed' };
+        return { ok: false, status: 0, error: errMsg };
       }
 
       const cr = res.result;
@@ -1226,8 +1323,16 @@
       }
     }
 
+    // If the stream tab is closed, any in-page strategy cannot work; switch to header-replay
+    if (isTabClosed && (workingStrategy === 'same-frame' || workingStrategy === 'content-script')) {
+      workingStrategy = 'header-replay';
+      updateDebugActiveStrategy('header-replay (standalone)');
+    }
+
     // Try strategy chain in order: A (same-frame) -> B (content-script) -> C (header-replay)
-    const strategies = ['same-frame', 'content-script', 'header-replay'];
+    const strategies = isTabClosed
+      ? ['header-replay']
+      : ['same-frame', 'content-script', 'header-replay'];
     let lastError = null;
     let lastStatus = 0;
 
@@ -1236,9 +1341,9 @@
       try {
         const res = await executeStrategy(strat, url, { responseType, isPlaylist, headers, signal });
         if (res && res.ok) {
-          if (!workingStrategy) {
+          if (workingStrategy !== strat) {
+            console.log(`[Fetch Strategy] Switched working strategy from ${workingStrategy || 'none'} to ${strat}`);
             workingStrategy = strat;
-            console.log(`[Fetch Strategy] Successfully established working strategy: ${strat}`);
             updateDebugActiveStrategy(strat);
           }
           return res;
@@ -1974,7 +2079,25 @@
       await SegmentStore.clearDownload(sessionDownloadId).catch(() => {});
     }
 
-    await applyRequestHeaders();
+    // Check origin stream tab status
+    if (currentTabId > 0 && typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.get) {
+      chrome.tabs.get(currentTabId, (tab) => {
+        if (chrome.runtime.lastError || !tab) {
+          isTabClosed = true;
+          workingStrategy = 'header-replay';
+          updateDebugActiveStrategy('header-replay (standalone)');
+        }
+      });
+    }
+
+    // Prepare DNR rules for both stream playlist host and segment hosts before downloading
+    const initialHosts = [playlistUrl];
+    if (segmentsList && segmentsList.length > 0) {
+      if (segmentsList[0].url) initialHosts.push(segmentsList[0].url);
+      const lastSeg = segmentsList[segmentsList.length - 1];
+      if (lastSeg && lastSeg.url) initialHosts.push(lastSeg.url);
+    }
+    await applyRequestHeaders(initialHosts);
     startSpeedMonitor();
 
     const safeTitle = cleanFilename(filenameInput.value || originalTitle);

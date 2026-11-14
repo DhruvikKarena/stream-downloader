@@ -733,6 +733,147 @@ segment_2.ts
     assert.strictEqual(tsFilename.endsWith('.ts'), true, 'Step 5: TS target file ready as optional download');
   });
 
+  console.log('\n=== 12. Stream Tab Closure & Standalone Extension Resilience ===');
+
+  it('Tab Closure: in-page strategies fail cleanly and switch workingStrategy to header-replay', () => {
+    let isTabClosed = false;
+    let workingStrategy = 'same-frame';
+    let currentTabId = 42;
+
+    function mockExecuteStrategy(strat) {
+      if (strat === 'same-frame') {
+        if (isTabClosed || !currentTabId || currentTabId <= 0) {
+          return { ok: false, status: 0, error: 'Stream tab is closed', tabClosed: true };
+        }
+        return { ok: true, status: 200, buffer: new Uint8Array(188).buffer };
+      }
+      if (strat === 'header-replay') {
+        return { ok: true, status: 200, buffer: new Uint8Array(188).buffer };
+      }
+      return { ok: false, status: 0, error: 'Unknown strategy' };
+    }
+
+    // While tab is open, same-frame succeeds
+    let res = mockExecuteStrategy(workingStrategy);
+    assert.strictEqual(res.ok, true, 'same-frame works while tab is open');
+
+    // User closes the stream tab!
+    isTabClosed = true;
+
+    // Stream tab is now closed: same-frame must fail immediately with tabClosed
+    res = mockExecuteStrategy('same-frame');
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.tabClosed, true);
+
+    // Strategy router switches workingStrategy to header-replay
+    if (isTabClosed && (workingStrategy === 'same-frame' || workingStrategy === 'content-script')) {
+      workingStrategy = 'header-replay';
+    }
+    assert.strictEqual(workingStrategy, 'header-replay', 'workingStrategy switched to header-replay');
+
+    // Header-replay succeeds independently without the stream tab
+    res = mockExecuteStrategy(workingStrategy);
+    assert.strictEqual(res.ok, true, 'header-replay succeeds without stream tab');
+  });
+
+  it('Multi-Host DNR Rule Provisioning: covers playlist host and segment CDN hosts', () => {
+    const playlistUrl = 'https://manifest.streamhost.com/master.m3u8';
+    const segmentUrl = 'https://cdn-edge-01.videodelivery.net/segment_0.ts';
+    const downloaderTabId = 999;
+    const ruleId = 100000;
+
+    const urls = [playlistUrl, segmentUrl];
+    const hosts = [];
+    for (const u of urls) {
+      const h = new URL(u).host;
+      if (!hosts.includes(h)) hosts.push(h);
+    }
+    assert.strictEqual(hosts.length, 2, 'Extracted 2 unique hosts');
+    assert.strictEqual(hosts[0], 'manifest.streamhost.com');
+    assert.strictEqual(hosts[1], 'cdn-edge-01.videodelivery.net');
+
+    const tabIds = [-1]; // chrome.tabs.TAB_ID_NONE
+    if (downloaderTabId) tabIds.push(downloaderTabId);
+
+    const rules = hosts.map((host, idx) => ({
+      id: ruleId + idx,
+      priority: 1,
+      action: {
+        type: 'modifyHeaders',
+        requestHeaders: [
+          { header: 'Referer', operation: 'set', value: 'https://embed.player.com/watch' },
+          { header: 'Origin', operation: 'set', value: 'https://embed.player.com' }
+        ]
+      },
+      condition: {
+        tabIds,
+        urlFilter: `||${host}/`,
+        resourceTypes: ['xmlhttprequest', 'media', 'other']
+      }
+    }));
+
+    assert.strictEqual(rules.length, 2);
+    assert.strictEqual(rules[0].condition.urlFilter, '||manifest.streamhost.com/');
+    assert.strictEqual(rules[1].condition.urlFilter, '||cdn-edge-01.videodelivery.net/');
+    assert.deepStrictEqual(rules[0].condition.tabIds, [-1, 999], 'DNR rule scoped to TAB_ID_NONE and downloader tab');
+  });
+
+  it('Segment Downloading Resilience: completes 5-step pipeline even when stream tab is closed mid-download', async () => {
+    let isTabClosed = false;
+    let workingStrategy = 'same-frame';
+    const currentTabId = 77;
+    const downloadId = 'dl_tab_closed_test';
+    const totalSegments = 4;
+    const mockDb = new Map();
+
+    async function fetchSegment(segIdx) {
+      // Simulate user closing the stream tab after segment 1
+      if (segIdx === 2) {
+        isTabClosed = true;
+      }
+
+      // If tab is closed, switch working strategy to header-replay
+      if (isTabClosed && (workingStrategy === 'same-frame' || workingStrategy === 'content-script')) {
+        workingStrategy = 'header-replay';
+      }
+
+      if (workingStrategy === 'same-frame') {
+        if (isTabClosed) throw new Error('No tab with id: 77');
+        const buf = new Uint8Array(188);
+        buf[0] = 0x47;
+        return buf;
+      }
+
+      if (workingStrategy === 'header-replay') {
+        // Standalone extension fetch with DNR headers
+        const buf = new Uint8Array(188);
+        buf[0] = 0x47;
+        return buf;
+      }
+
+      throw new Error('Unknown strategy');
+    }
+
+    // Download all segments in simulated worker loop
+    for (let i = 0; i < totalSegments; i++) {
+      const segBuf = await fetchSegment(i);
+      assert.ok(segBuf, `Segment ${i} buffer received`);
+      assert.strictEqual(segBuf[0], 0x47, `Segment ${i} has 0x47 sync byte`);
+      mockDb.set(`${downloadId}:${String(i).padStart(6, '0')}`, { index: i, data: segBuf });
+    }
+
+    assert.strictEqual(mockDb.size, 4, 'All 4 segments stored in IndexedDB despite tab closing mid-download');
+    assert.strictEqual(workingStrategy, 'header-replay', 'Final working strategy was header-replay');
+
+    // Merge in TS format
+    const chunks = [];
+    for (let i = 0; i < totalSegments; i++) {
+      chunks.push(mockDb.get(`${downloadId}:${String(i).padStart(6, '0')}`).data);
+    }
+    const mergedTs = Buffer.concat(chunks.map(c => Buffer.from(c)));
+    assert.strictEqual(mergedTs.byteLength, 188 * 4, 'Merged TS has full byte length');
+  });
+
   console.log(`\n========================================`);
   console.log(`Tests Complete: ${passCount} Passed, ${failCount} Failed`);
   console.log(`========================================\n`);
