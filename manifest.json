@@ -5,8 +5,10 @@
   "description": "Detect and download streaming videos (HLS/M3U8, DASH/MPD, MP4) with multi-threaded downloading",
   "permissions": [
     "webRequest",
+    "webNavigation",
     "declarativeNetRequest",
     "declarativeNetRequestWithHostAccess",
+    "declarativeNetRequestFeedback",
     "storage",
     "cookies",
     "scripting",
@@ -34,12 +36,16 @@
     {
       "matches": ["<all_urls>"],
       "js": ["content.js"],
-      "run_at": "document_start"
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": true
     },
     {
       "matches": ["<all_urls>"],
       "js": ["inject.js"],
       "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": true,
       "world": "MAIN"
     }
   ],
@@ -47,6 +53,7 @@
     {
       "resources": [
         "inject.js",
+        "frame-context.js",
         "hls-parser.js",
         "codec-detect.js",
         "segment-store.js",

@@ -563,9 +563,13 @@
 
     // Retrieve active tab URL to pass as Referer/Origin
     let activePageUrl = '';
+    let activeTabId = 0;
     try {
       const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (activeTab && activeTab.url) activePageUrl = activeTab.url;
+      if (activeTab) {
+        if (activeTab.url) activePageUrl = activeTab.url;
+        if (activeTab.id) activeTabId = activeTab.id;
+      }
     } catch {}
 
     // Open downloader.html in a new tab (conforming to specification)
@@ -574,6 +578,18 @@
     );
     if (activePageUrl) {
       dlUrl += `&referer=${encodeURIComponent(activePageUrl)}`;
+    }
+    if (activeTabId) {
+      dlUrl += `&tabId=${activeTabId}`;
+    }
+    if (item.meta && item.meta.frameId !== undefined) {
+      dlUrl += `&frameId=${item.meta.frameId}`;
+    }
+    if (item.meta && item.meta.frameUrl) {
+      dlUrl += `&frameUrl=${encodeURIComponent(item.meta.frameUrl)}`;
+    }
+    if (item.meta && item.meta.initiator) {
+      dlUrl += `&initiator=${encodeURIComponent(item.meta.initiator)}`;
     }
     if (audioUrl && !isAudioItem) {
       dlUrl += `&audioUrl=${encodeURIComponent(audioUrl)}`;

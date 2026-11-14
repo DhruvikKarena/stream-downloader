@@ -124,9 +124,11 @@ chmod +x install_linux.sh
 
 | Permission | Purpose |
 | :--- | :--- |
-| `webRequest` | Non-blocking observation of network requests (`onSendHeaders` with `extraHeaders`) to capture `.m3u8` / `.mpd` requests and extract authentic playback headers (`Referer`, `Origin`, `User-Agent`, `Accept-Language`). |
-| `declarativeNetRequest` | Creates dynamic session rules to replay captured request headers (`Referer`, `Origin`, `User-Agent`, `Accept-Language`) scoped specifically to the extension's own requests (`tabIds: [chrome.tabs.TAB_ID_NONE]`). |
+| `webRequest` | Non-blocking observation of network requests (`onSendHeaders` with `extraHeaders`) to capture `.m3u8`, `.mpd`, key, and segment requests and extract authentic playback headers (`Referer`, `Origin`, `User-Agent`, `Accept-Language`, custom headers). |
+| `webNavigation` | Resolves cross-origin iframe URLs (`getFrame` and `getAllFrames`) so the player's exact iframe origin and frame URL can be used as the Referer and Origin for cross-origin embedded streams (such as `surrit.com`). |
+| `declarativeNetRequest` | Creates dynamic session rules to replay captured request headers (`Referer`, `Origin`, `User-Agent`, `Accept-Language`, custom headers) scoped specifically to the extension's own requests (`tabIds: [chrome.tabs.TAB_ID_NONE]`). |
 | `declarativeNetRequestWithHostAccess` | Permits modifying request headers on host URLs without requiring static declarative rule files. |
+| `declarativeNetRequestFeedback` | Verifies whether declarativeNetRequest session rules matched and fired (`chrome.declarativeNetRequest.getMatchedRules`) for real-time diagnostic reporting. |
 | `storage` | Persists per-tab media stream lists, real request headers in `chrome.storage.session`, and user quality preferences in `chrome.storage.local`. |
 | `cookies` | Attaches authenticated site session cookies to `fetch(url, { credentials: "include" })` to prevent HTTP 403 Forbidden errors on cookie-gated streams. |
 | `scripting` | Provides the page-context fallback (`chrome.scripting.executeScript` into `world: "MAIN"`) to execute fetches directly inside the host tab when bot protection or CORS blocks extension-level requests. |

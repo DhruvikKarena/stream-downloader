@@ -60,6 +60,9 @@ const activeDownloads = new Map();
 /** Map<string, Object>  —  streamUrl → captured request context (Referer, Origin, User-Agent, Accept-Language, pageUrl) */
 const requestContextByUrl = new Map();
 
+/** Map<string, Object>  —  playlistUrl → cached playlist content intercepted from player (Requirement 2) */
+const cachedPlaylistsByUrl = new Map();
+
 /**
  * @typedef {Object} MediaItem
  * @property {string}  url       - The detected media URL.
@@ -493,90 +496,145 @@ chrome.webRequest.onHeadersReceived.addListener(
   ['responseHeaders']
 );
 
-// C. On send headers — detects .m3u8, .mpd, direct .mp4/.webm with Referer, Origin, User-Agent (ignoring .ts/.m4s)
+// C. On send headers — captures .m3u8, .mpd, key, segment, and direct video requests with full frame context
 chrome.webRequest.onSendHeaders.addListener(
   (details) => {
-    const { url, tabId, requestHeaders } = details;
+    const { url, tabId, frameId, parentFrameId, documentId, initiator, requestHeaders } = details;
     if (tabId < 0 || isIgnoredDomain(url)) return;
 
-    // Ignore individual segments (.ts, .m4s, chunk files)
     const lower = url.toLowerCase();
     const pathname = (urlPathname(url) || '').toLowerCase();
-    if (pathname.endsWith('.ts') || pathname.endsWith('.m4s') ||
-        /\.(ts|m4s)($|\?|#)/i.test(url) ||
-        lower.includes('/segment') || lower.includes('seg-')) {
-      return;
-    }
 
-    // Detect .m3u8, .mpd, and direct .mp4/.webm requests
-    let mediaType = null;
-    let format = '';
-    if (/\.m3u8($|\?|#)/i.test(url) || lower.includes('.m3u8')) {
-      mediaType = 'hls';
-      format = 'm3u8';
-    } else if (/\.mpd($|\?|#)/i.test(url) || lower.includes('.mpd')) {
-      mediaType = 'dash';
-      format = 'mpd';
-    } else if (/\.mp4($|\?|#)/i.test(url) || lower.includes('.mp4') || lower.includes('mime=video%2fmp4') || lower.includes('mime=video/mp4')) {
-      mediaType = 'video';
-      format = 'mp4';
-    } else if (/\.webm($|\?|#)/i.test(url) || lower.includes('.webm') || lower.includes('mime=video%2fwebm') || lower.includes('mime=video/webm')) {
-      mediaType = 'video';
-      format = 'webm';
-    } else if (lower.includes('videoplayback')) {
-      const classified = classifyMediaUrl(url);
-      if (classified) {
-        mediaType = classified.type;
-        format = classified.format || 'mp4';
-      }
-    }
+    // Check if this request is .m3u8, .mpd, direct video, key, or segment (Requirement 1)
+    const isM3u8 = /\.m3u8($|\?|#)/i.test(url) || lower.includes('.m3u8');
+    const isMpd = /\.mpd($|\?|#)/i.test(url) || lower.includes('.mpd');
+    const isKey = /\.key($|\?|#)/i.test(url) || lower.includes('/key') || lower.includes('key=');
+    const isSegment = pathname.endsWith('.ts') || pathname.endsWith('.m4s') ||
+                      /\.(ts|m4s)($|\?|#)/i.test(url) ||
+                      lower.includes('/segment') || lower.includes('seg-');
+    const isDirectVideo = /\.mp4($|\?|#)/i.test(url) || lower.includes('.mp4') ||
+                          /\.webm($|\?|#)/i.test(url) || lower.includes('.webm') ||
+                          lower.includes('videoplayback');
 
-    if (!mediaType) return;
+    if (!isM3u8 && !isMpd && !isKey && !isSegment && !isDirectVideo) return;
 
-    // Extract Referer, Origin, User-Agent, and Accept-Language (Section A.1)
+    // Extract Referer, Origin, User-Agent, Accept, Accept-Language, Cookie presence & custom headers
     let referer = '';
     let origin = '';
     let userAgent = '';
+    let accept = '';
     let acceptLanguage = '';
+    let hasCookie = false;
+    const customHeaders = [];
+
     if (requestHeaders) {
       for (const h of requestHeaders) {
-        const name = (h.name || '').toLowerCase();
-        if (name === 'referer') referer = h.value || '';
-        else if (name === 'origin') origin = h.value || '';
-        else if (name === 'user-agent') userAgent = h.value || '';
-        else if (name === 'accept-language') acceptLanguage = h.value || '';
+        const nameLower = (h.name || '').toLowerCase();
+        if (nameLower === 'referer') referer = h.value || '';
+        else if (nameLower === 'origin') origin = h.value || '';
+        else if (nameLower === 'user-agent') userAgent = h.value || '';
+        else if (nameLower === 'accept') accept = h.value || '';
+        else if (nameLower === 'accept-language') acceptLanguage = h.value || '';
+        else if (nameLower === 'cookie') hasCookie = true;
+        else if (nameLower.startsWith('x-') || nameLower.startsWith('sec-ch-') || nameLower.startsWith('sec-fetch-') || nameLower === 'range') {
+          customHeaders.push({ name: h.name, value: h.value });
+        }
       }
     }
 
-    chrome.tabs.get(tabId, (tab) => {
-      const pageUrl = (tab && tab.url) ? tab.url : (referer || '');
+    const targetFrameId = frameId !== undefined ? frameId : 0;
+
+    const processContext = (frameUrl, tab) => {
+      // Use frameUrl / initiator (the iframe), NOT the tab URL, as Referer/Origin source (Requirement 1)
+      let effectiveReferer = referer;
+      if (!effectiveReferer) {
+        if (frameUrl && frameUrl !== 'about:blank') {
+          effectiveReferer = frameUrl;
+        } else if (initiator) {
+          effectiveReferer = initiator.endsWith('/') ? initiator : initiator + '/';
+        }
+      }
+
+      let effectiveOrigin = origin;
+      if (!effectiveOrigin) {
+        if (frameUrl && frameUrl !== 'about:blank') {
+          try { effectiveOrigin = new URL(frameUrl).origin; } catch {}
+        }
+        if (!effectiveOrigin && initiator) {
+          try { effectiveOrigin = new URL(initiator).origin; } catch {}
+        }
+      }
+
       const reqContext = {
         url,
-        referer,
-        origin,
-        userAgent,
-        acceptLanguage,
-        pageUrl,
         tabId,
-        format,
+        frameId: targetFrameId,
+        parentFrameId: parentFrameId !== undefined ? parentFrameId : -1,
+        documentId: documentId || '',
+        initiator: initiator || '',
+        frameUrl: frameUrl || '',
+        pageUrl: (tab && tab.url) ? tab.url : '', // Top-level tab URL
+        referer: effectiveReferer,
+        origin: effectiveOrigin,
+        rawReferer: referer,
+        rawOrigin: origin,
+        userAgent,
+        accept,
+        acceptLanguage,
+        hasCookie,
+        customHeaders,
+        format: isM3u8 ? 'm3u8' : (isMpd ? 'mpd' : 'mp4'),
         timestamp: Date.now()
       };
 
-      // Persist in memory & chrome.storage.session
+      // Store by full URL and by stream host
       requestContextByUrl.set(url, reqContext);
+      try {
+        const u = new URL(url);
+        requestContextByUrl.set('host_' + u.host, reqContext);
+      } catch {}
+
       try {
         const cleanKey = 'stream_ctx_' + btoa(unescape(encodeURIComponent(url))).replace(/[+/=]/g, '_');
         chrome.storage.session.set({ [cleanKey]: reqContext }).catch(() => {});
       } catch (_) {}
 
-      addMediaItem(tabId, url, mediaType, 'onSendHeaders', 0, {
-        referer,
-        origin,
-        userAgent,
-        acceptLanguage,
-        pageUrl,
-        format
-      });
+      // Add to popup media list if top-level stream (ignore raw segments and standalone key requests in popup list)
+      if (isM3u8 || isMpd || isDirectVideo) {
+        let mediaType = isM3u8 ? 'hls' : (isMpd ? 'dash' : 'video');
+        let format = isM3u8 ? 'm3u8' : (isMpd ? 'mpd' : 'mp4');
+        addMediaItem(tabId, url, mediaType, 'onSendHeaders', 0, {
+          referer: effectiveReferer,
+          origin: effectiveOrigin,
+          userAgent,
+          acceptLanguage,
+          pageUrl: (tab && tab.url) ? tab.url : '',
+          frameId: targetFrameId,
+          frameUrl: frameUrl || '',
+          initiator: initiator || '',
+          format,
+          customHeaders
+        });
+      }
+    };
+
+    chrome.tabs.get(tabId, (tab) => {
+      if (chrome.runtime.lastError) {
+        tab = null;
+      }
+      if (targetFrameId > 0 && chrome.webNavigation && chrome.webNavigation.getFrame) {
+        chrome.webNavigation.getFrame({ tabId, frameId: targetFrameId }, (frameDetails) => {
+          let resolvedUrl = '';
+          if (!chrome.runtime.lastError && frameDetails && frameDetails.url && frameDetails.url !== 'about:blank') {
+            resolvedUrl = frameDetails.url;
+          } else if (initiator) {
+            resolvedUrl = initiator;
+          }
+          processContext(resolvedUrl, tab);
+        });
+      } else {
+        processContext(tab ? tab.url : (initiator || ''), tab);
+      }
     });
   },
   { urls: ['<all_urls>'] },
@@ -1323,6 +1381,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       const targetUrl = message.url || '';
       let ctx = requestContextByUrl.get(targetUrl);
+
+      // Search by stream host if not found directly
+      if (!ctx && targetUrl) {
+        try {
+          const u = new URL(targetUrl);
+          ctx = requestContextByUrl.get('host_' + u.host);
+        } catch (_) {}
+      }
+
+      // Check storage.session
       if (!ctx && targetUrl) {
         try {
           const cleanKey = 'stream_ctx_' + btoa(unescape(encodeURIComponent(targetUrl))).replace(/[+/=]/g, '_');
@@ -1331,10 +1399,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         } catch (_) {}
       }
 
-      // Fallback search across tab media items if exact URL wasn't in memory
+      // Fallback search across tab media items
       if (!ctx) {
         for (const items of mediaByTab.values()) {
-          const match = items.find(i => i.url === targetUrl || (i.meta && i.meta.pageUrl));
+          const match = items.find(i => i.url === targetUrl || (targetUrl && i.url && targetUrl.includes(urlPathname(i.url))));
           if (match && match.meta) {
             ctx = {
               url: targetUrl,
@@ -1343,6 +1411,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               userAgent: match.meta.userAgent || '',
               acceptLanguage: match.meta.acceptLanguage || '',
               pageUrl: match.meta.pageUrl || '',
+              frameId: match.meta.frameId || 0,
+              frameUrl: match.meta.frameUrl || '',
+              initiator: match.meta.initiator || '',
+              customHeaders: match.meta.customHeaders || [],
               tabId: match.tabId
             };
             break;
@@ -1355,20 +1427,84 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async
   }
 
+  if (action === 'cachePlaylist') {
+    const { url, finalUrl, text, format, frameUrl, status } = message;
+    if (url && text) {
+      const entry = {
+        url,
+        finalUrl: finalUrl || url,
+        text,
+        format: format || 'm3u8',
+        frameUrl: frameUrl || '',
+        status: status || 200,
+        timestamp: Date.now()
+      };
+      cachedPlaylistsByUrl.set(url, entry);
+      if (finalUrl && finalUrl !== url) {
+        cachedPlaylistsByUrl.set(finalUrl, entry);
+      }
+      try {
+        const u = new URL(url);
+        cachedPlaylistsByUrl.set(u.origin + u.pathname, entry);
+      } catch (_) {}
+
+      try {
+        const cleanKey = 'stream_cache_' + btoa(unescape(encodeURIComponent(url))).replace(/[+/=]/g, '_');
+        chrome.storage.session.set({ [cleanKey]: entry }).catch(() => {});
+      } catch (_) {}
+    }
+    sendResponse({ success: true });
+    return false;
+  }
+
+  if (action === 'getCachedPlaylist') {
+    const targetUrl = message.url || '';
+    (async () => {
+      let entry = cachedPlaylistsByUrl.get(targetUrl);
+      if (!entry && targetUrl) {
+        try {
+          const u = new URL(targetUrl);
+          entry = cachedPlaylistsByUrl.get(u.origin + u.pathname);
+        } catch (_) {}
+      }
+
+      if (!entry && targetUrl) {
+        try {
+          const cleanKey = 'stream_cache_' + btoa(unescape(encodeURIComponent(targetUrl))).replace(/[+/=]/g, '_');
+          const data = await chrome.storage.session.get(cleanKey);
+          if (data && data[cleanKey]) entry = data[cleanKey];
+        } catch (_) {}
+      }
+
+      if (entry) {
+        sendResponse({ success: true, cached: true, entry });
+      } else {
+        sendResponse({ success: true, cached: false, entry: null });
+      }
+    })();
+    return true; // async
+  }
+
   if (action === 'setDownloadHeaders') {
     const ruleId = parseInt(message.ruleId, 10) || 8888;
-    const referer = message.referer || '';
-    const origin = message.origin || '';
+    const frameUrl = message.frameUrl || '';
+    const referer = frameUrl || message.referer || '';
+    let origin = message.origin || '';
+    if (!origin && referer) {
+      try { origin = new URL(referer).origin; } catch {}
+    }
     const userAgent = message.userAgent || '';
     const acceptLanguage = message.acceptLanguage || '';
+    const accept = message.accept || '';
     const streamUrl = message.url || '';
+    const customHeaders = message.customHeaders || [];
 
-    // Scope urlFilter to the stream host (Section A.2)
+    // Scope urlFilter to ||<stream host>/ (Requirement 2.C)
     let urlFilter = '*';
     if (streamUrl) {
       try {
         const u = new URL(streamUrl);
-        urlFilter = `||${u.host}`;
+        urlFilter = `||${u.host}/`;
       } catch {}
     }
 
@@ -1385,6 +1521,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (acceptLanguage) {
       requestHeaders.push({ header: 'Accept-Language', operation: 'set', value: acceptLanguage });
     }
+    if (accept) {
+      requestHeaders.push({ header: 'Accept', operation: 'set', value: accept });
+    }
+    if (Array.isArray(customHeaders)) {
+      for (const ch of customHeaders) {
+        if (ch && ch.name && ch.value) {
+          const lowerName = ch.name.toLowerCase();
+          if (!['cookie', 'referer', 'origin', 'user-agent', 'accept-language', 'accept'].includes(lowerName)) {
+            requestHeaders.push({ header: ch.name, operation: 'set', value: ch.value });
+          }
+        }
+      }
+    }
 
     if (chrome.declarativeNetRequest && requestHeaders.length > 0) {
       chrome.declarativeNetRequest.updateSessionRules({
@@ -1400,17 +1549,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             // Scoped strictly to the extension's own requests (TAB_ID_NONE)
             tabIds: [chrome.tabs.TAB_ID_NONE],
             urlFilter,
-            resourceTypes: ['xmlhttprequest', 'other']
+            resourceTypes: ['xmlhttprequest', 'media', 'other']
           }
         }]
-      }).then(() => sendResponse({ success: true, ruleId }))
+      }).then(() => sendResponse({ success: true, ruleId, urlFilter, requestHeaders }))
         .catch(err => {
           console.warn('updateSessionRules error:', err);
           sendResponse({ success: false, error: err.message });
         });
       return true;
     }
-    sendResponse({ success: true });
+    sendResponse({ success: true, ruleId });
     return false;
   }
 
@@ -1427,10 +1576,40 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
+  if (action === 'getMatchedRules') {
+    if (chrome.declarativeNetRequest && chrome.declarativeNetRequest.getMatchedRules) {
+      chrome.declarativeNetRequest.getMatchedRules({ tabId: chrome.tabs.TAB_ID_NONE })
+        .then(res => sendResponse({ success: true, rulesMatchedInfo: res.rulesMatchedInfo || [] }))
+        .catch(err => sendResponse({ success: false, error: err.message, rulesMatchedInfo: [] }));
+      return true;
+    }
+    sendResponse({ success: true, rulesMatchedInfo: [] });
+    return false;
+  }
+
+  if (action === 'getAllFrames') {
+    const tabId = parseInt(message.tabId, 10);
+    if (chrome.webNavigation && chrome.webNavigation.getAllFrames && tabId > 0) {
+      chrome.webNavigation.getAllFrames({ tabId }, (frames) => {
+        if (chrome.runtime.lastError || !frames) {
+          sendResponse({ success: false, frames: [] });
+        } else {
+          sendResponse({ success: true, frames });
+        }
+      });
+      return true;
+    }
+    sendResponse({ success: true, frames: [] });
+    return false;
+  }
+
   if (action === 'fetchFromPageContext') {
     const targetTabId = parseInt(message.tabId, 10);
+    let targetFrameId = message.frameId !== undefined ? parseInt(message.frameId, 10) : 0;
     const targetUrl = message.url;
-    const responseType = message.responseType || 'text'; // 'text' or 'bytes'
+    const responseType = message.responseType || 'text'; // 'text' or 'bytes' / 'arraybuffer'
+    const expectedFrameUrl = message.frameUrl || '';
+    const initiator = message.initiator || '';
 
     (async () => {
       try {
@@ -1438,63 +1617,205 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           throw new Error('chrome.scripting API is not available');
         }
         if (!targetTabId || targetTabId < 0) {
-          throw new Error('No valid tabId specified for page-context fetch');
+          throw new Error('No valid tabId specified for frame fetch');
         }
 
-        const results = await chrome.scripting.executeScript({
-          target: { tabId: targetTabId },
-          world: 'MAIN',
-          func: async (fetchUrl, type) => {
-            try {
-              const res = await fetch(fetchUrl, { credentials: 'include' });
-              const headers = {};
-              res.headers.forEach((v, k) => { headers[k.toLowerCase()] = v; });
+        async function tryExecuteInFrame(fId, world) {
+          const target = { tabId: targetTabId };
+          if (fId !== undefined && fId !== null && fId >= 0) {
+            target.frameIds = [fId];
+          }
 
-              if (type === 'bytes' || type === 'arrayBuffer') {
-                const buf = await res.arrayBuffer();
-                const bytes = new Uint8Array(buf);
-                let binary = '';
-                const len = bytes.byteLength;
-                for (let i = 0; i < len; i += 8192) {
-                  binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + 8192, len)));
+          const results = await chrome.scripting.executeScript({
+            target,
+            world,
+            func: async (fetchUrl, type) => {
+              try {
+                // Same-frame fetch: credentials include & referrer is frame location.href (Requirement 2.A)
+                const res = await fetch(fetchUrl, {
+                  credentials: 'include',
+                  referrer: location.href
+                });
+                const headers = {};
+                res.headers.forEach((v, k) => { headers[k.toLowerCase()] = v; });
+
+                if (type === 'bytes' || type === 'arrayBuffer') {
+                  const buf = await res.arrayBuffer();
+                  const bytes = new Uint8Array(buf);
+                  const totalBytes = bytes.byteLength;
+                  const CHUNK_SIZE = 16 * 1024 * 1024; // 16 MB chunks (well under 32 MB limit)
+
+                  if (totalBytes > CHUNK_SIZE) {
+                    const chunks = [];
+                    for (let offset = 0; offset < totalBytes; offset += CHUNK_SIZE) {
+                      const slice = bytes.subarray(offset, Math.min(offset + CHUNK_SIZE, totalBytes));
+                      let binary = '';
+                      const sliceLen = slice.byteLength;
+                      for (let i = 0; i < sliceLen; i += 8192) {
+                        binary += String.fromCharCode.apply(null, slice.subarray(i, Math.min(i + 8192, sliceLen)));
+                      }
+                      chunks.push(btoa(binary));
+                    }
+                    return {
+                      ok: res.ok,
+                      status: res.status,
+                      statusText: res.statusText,
+                      contentType: res.headers.get('content-type') || '',
+                      url: res.url,
+                      redirected: res.redirected,
+                      headers,
+                      chunks,
+                      byteLength: totalBytes,
+                      frameLocation: location.href
+                    };
+                  } else {
+                    let binary = '';
+                    for (let i = 0; i < totalBytes; i += 8192) {
+                      binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + 8192, totalBytes)));
+                    }
+                    return {
+                      ok: res.ok,
+                      status: res.status,
+                      statusText: res.statusText,
+                      contentType: res.headers.get('content-type') || '',
+                      url: res.url,
+                      redirected: res.redirected,
+                      headers,
+                      base64: btoa(binary),
+                      byteLength: totalBytes,
+                      frameLocation: location.href
+                    };
+                  }
+                } else {
+                  const text = await res.text();
+                  return {
+                    ok: res.ok,
+                    status: res.status,
+                    statusText: res.statusText,
+                    contentType: res.headers.get('content-type') || '',
+                    url: res.url,
+                    redirected: res.redirected,
+                    headers,
+                    text,
+                    frameLocation: location.href
+                  };
                 }
+              } catch (err) {
                 return {
-                  ok: res.ok,
-                  status: res.status,
-                  statusText: res.statusText,
-                  url: res.url,
-                  redirected: res.redirected,
-                  headers,
-                  base64: btoa(binary)
-                };
-              } else {
-                const text = await res.text();
-                return {
-                  ok: res.ok,
-                  status: res.status,
-                  statusText: res.statusText,
-                  url: res.url,
-                  redirected: res.redirected,
-                  headers,
-                  text
+                  ok: false,
+                  status: 0,
+                  statusText: err.name || 'FetchError',
+                  error: err.message,
+                  frameLocation: typeof location !== 'undefined' ? location.href : ''
                 };
               }
-            } catch (err) {
-              return {
-                ok: false,
-                status: 0,
-                error: err.message
-              };
-            }
-          },
-          args: [targetUrl, responseType]
-        });
+            },
+            args: [targetUrl, responseType]
+          });
 
-        if (!results || !results[0] || !results[0].result) {
-          throw new Error('Page-context fetch returned no result');
+          if (results && results[0] && results[0].result) {
+            return results[0].result;
+          }
+          return null;
         }
 
-        sendResponse({ success: true, result: results[0].result });
+        // 1. Try targetFrameId in MAIN world
+        let execResult = null;
+        let usedWorld = 'MAIN';
+        let usedFrameId = targetFrameId;
+
+        try {
+          execResult = await tryExecuteInFrame(targetFrameId, 'MAIN');
+        } catch (mainErr) {
+          console.warn(`[Frame Fetch] MAIN world execution failed in frame ${targetFrameId}:`, mainErr.message);
+        }
+
+        // 2. Fall back to ISOLATED world if MAIN failed or errored (Requirement 2.A)
+        if (!execResult || (!execResult.ok && execResult.status === 0)) {
+          try {
+            usedWorld = 'ISOLATED';
+            execResult = await tryExecuteInFrame(targetFrameId, 'ISOLATED');
+          } catch (isoErr) {
+            console.warn(`[Frame Fetch] ISOLATED world execution failed in frame ${targetFrameId}:`, isoErr.message);
+          }
+        }
+
+        // 3. Stale frame recovery: Re-resolve via getAllFrames and try candidate frames (Requirement 2.A)
+        if (!execResult || (!execResult.ok && execResult.status === 0)) {
+          if (chrome.webNavigation && chrome.webNavigation.getAllFrames) {
+            const allFrames = await new Promise((resolve) => {
+              chrome.webNavigation.getAllFrames({ tabId: targetTabId }, resolve);
+            });
+
+            if (Array.isArray(allFrames)) {
+              const candidateFrames = allFrames.filter(f => {
+                if (f.frameId === targetFrameId) return false;
+                if (expectedFrameUrl && f.url && f.url.includes(new URL(expectedFrameUrl).host)) return true;
+                if (initiator && f.url && f.url.includes(new URL(initiator).host)) return true;
+                return f.frameId !== 0;
+              });
+
+              for (const cand of candidateFrames) {
+                console.log(`[Frame Fetch] Attempting candidate frame ${cand.frameId} (${cand.url})...`);
+                try {
+                  const candRes = await tryExecuteInFrame(cand.frameId, 'MAIN');
+                  if (candRes && candRes.ok) {
+                    execResult = candRes;
+                    usedFrameId = cand.frameId;
+                    usedWorld = 'MAIN';
+                    break;
+                  }
+                } catch (_) {}
+              }
+            }
+          }
+        }
+
+        if (execResult) {
+          sendResponse({
+            success: true,
+            result: execResult,
+            frameId: usedFrameId,
+            world: usedWorld
+          });
+        } else {
+          sendResponse({ success: false, error: 'Could not execute fetch in target frame' });
+        }
+      } catch (err) {
+        sendResponse({ success: false, error: err.message });
+      }
+    })();
+    return true; // async
+  }
+
+  if (action === 'fetchFromContentScript') {
+    const targetTabId = parseInt(message.tabId, 10);
+    const targetFrameId = message.frameId !== undefined ? parseInt(message.frameId, 10) : 0;
+    const targetUrl = message.url;
+    const asType = message.responseType === 'arraybuffer' || message.responseType === 'bytes' ? 'arraybuffer' : 'text';
+
+    (async () => {
+      try {
+        const options = targetFrameId >= 0 ? { frameId: targetFrameId } : {};
+        chrome.tabs.sendMessage(targetTabId, {
+          type: 'FETCH',
+          url: targetUrl,
+          as: asType,
+          headers: message.headers || {}
+        }, options, (response) => {
+          if (chrome.runtime.lastError || !response) {
+            sendResponse({
+              success: false,
+              error: chrome.runtime.lastError ? chrome.runtime.lastError.message : 'No response from frame content script'
+            });
+          } else {
+            sendResponse({
+              success: true,
+              result: response,
+              frameId: targetFrameId
+            });
+          }
+        });
       } catch (err) {
         sendResponse({ success: false, error: err.message });
       }

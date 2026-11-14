@@ -187,11 +187,24 @@
     if (event.source !== window) return;
 
     const data = event.data;
-    if (!data || data.type !== MSG_TYPE) return;
+    if (!data) return;
 
-    const url = data.url;
-    if (url) {
-      reportMedia(url, data.source || 'inject', data.mediaType, data.size, data.meta);
+    if (data.type === MSG_TYPE) {
+      const url = data.url;
+      if (url) {
+        reportMedia(url, data.source || 'inject', data.mediaType, data.size, data.meta);
+      }
+    } else if (data.type === 'STREAM_PLAYLIST_CACHED') {
+      // Re-use what the player already loaded (Requirement 2)
+      safeSendMessage({
+        action: 'cachePlaylist',
+        url: data.url,
+        finalUrl: data.finalUrl,
+        text: data.text,
+        format: data.format,
+        frameUrl: data.frameUrl || location.href,
+        status: data.status
+      });
     }
   });
 
@@ -435,6 +448,97 @@
   // -------------------------------------------------------------------
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    // Strategy B: Frame Fetch Bridge (Cross-Origin Iframe fallback)
+    if (message.type === 'FETCH' || message.action === 'FETCH') {
+      (async () => {
+        try {
+          const fetchUrl = message.url;
+          const asType = message.as || 'text'; // 'text' | 'arraybuffer'
+          const headers = message.headers || {};
+
+          const res = await fetch(fetchUrl, {
+            credentials: 'include',
+            referrer: location.href,
+            headers
+          });
+
+          const resHeaders = {};
+          res.headers.forEach((v, k) => { resHeaders[k.toLowerCase()] = v; });
+
+          if (asType === 'arraybuffer' || asType === 'bytes') {
+            const buf = await res.arrayBuffer();
+            const bytes = new Uint8Array(buf);
+            const totalBytes = bytes.byteLength;
+            const CHUNK_SIZE = 16 * 1024 * 1024; // 16 MB per chunk (well under 32 MB limit)
+
+            if (totalBytes > CHUNK_SIZE) {
+              const chunks = [];
+              for (let offset = 0; offset < totalBytes; offset += CHUNK_SIZE) {
+                const slice = bytes.subarray(offset, Math.min(offset + CHUNK_SIZE, totalBytes));
+                let binary = '';
+                const sliceLen = slice.byteLength;
+                for (let i = 0; i < sliceLen; i += 8192) {
+                  binary += String.fromCharCode.apply(null, slice.subarray(i, Math.min(i + 8192, sliceLen)));
+                }
+                chunks.push(btoa(binary));
+              }
+              sendResponse({
+                ok: res.ok,
+                status: res.status,
+                statusText: res.statusText,
+                contentType: res.headers.get('content-type') || '',
+                url: res.url,
+                redirected: res.redirected,
+                headers: resHeaders,
+                chunks,
+                byteLength: totalBytes,
+                frameUrl: location.href
+              });
+            } else {
+              let binary = '';
+              for (let i = 0; i < totalBytes; i += 8192) {
+                binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + 8192, totalBytes)));
+              }
+              sendResponse({
+                ok: res.ok,
+                status: res.status,
+                statusText: res.statusText,
+                contentType: res.headers.get('content-type') || '',
+                url: res.url,
+                redirected: res.redirected,
+                headers: resHeaders,
+                base64: btoa(binary),
+                byteLength: totalBytes,
+                frameUrl: location.href
+              });
+            }
+          } else {
+            const text = await res.text();
+            sendResponse({
+              ok: res.ok,
+              status: res.status,
+              statusText: res.statusText,
+              contentType: res.headers.get('content-type') || '',
+              url: res.url,
+              redirected: res.redirected,
+              headers: resHeaders,
+              text,
+              frameUrl: location.href
+            });
+          }
+        } catch (err) {
+          sendResponse({
+            ok: false,
+            status: 0,
+            statusText: err.name || 'FetchError',
+            error: err.message,
+            frameUrl: location.href
+          });
+        }
+      })();
+      return true; // async
+    }
+
     if (message.action === 'HLS_STREAM_DETECTED') {
       sendResponse({ received: true });
       return false;

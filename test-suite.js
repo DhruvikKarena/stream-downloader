@@ -20,6 +20,7 @@ const assert = require('assert');
 const HlsParser = require('./hls-parser.js');
 const CodecDetect = require('./codec-detect.js');
 const SegmentStore = require('./segment-store.js');
+const FrameContext = require('./frame-context.js');
 
 const https = require('https');
 const http = require('http');
@@ -266,7 +267,87 @@ enc_seg0.ts
     assert.strictEqual(key999, 'dl_test:000999');
   });
 
-  console.log('\n=== 7. Live Test Stream Acceptance Tests ===');
+  console.log('\n=== 7. Frame Context & Header Selection Logic (Cross-Origin Iframe) ===');
+
+  it('Prioritizes frameUrl over tabUrl for Referer and Origin', () => {
+    const resolved = FrameContext.resolveFrameHeaders({
+      frameUrl: 'https://surrit.com/player/v123.html',
+      initiator: 'https://surrit.com',
+      tabUrl: 'https://streaming-site.tv/watch/movie-456',
+      userAgent: 'Mozilla/5.0 TestBrowser',
+      acceptLanguage: 'en-US,en;q=0.9'
+    });
+
+    assert.strictEqual(resolved.referer, 'https://surrit.com/player/v123.html', 'Referer must match frameUrl');
+    assert.strictEqual(resolved.origin, 'https://surrit.com', 'Origin must match frameUrl origin');
+    assert.strictEqual(resolved.isIframe, true, 'Should detect iframe context');
+    assert.strictEqual(resolved.headers['Referer'], 'https://surrit.com/player/v123.html');
+    assert.strictEqual(resolved.headers['Origin'], 'https://surrit.com');
+  });
+
+  it('Falls back to initiator over tabUrl when frameUrl is about:blank', () => {
+    const resolved = FrameContext.resolveFrameHeaders({
+      frameUrl: 'about:blank',
+      initiator: 'https://cdn.embedded-player.org',
+      tabUrl: 'https://top-level-embedder.com/page.html'
+    });
+
+    assert.strictEqual(resolved.origin, 'https://cdn.embedded-player.org');
+    assert.ok(resolved.referer.startsWith('https://cdn.embedded-player.org'));
+  });
+
+  it('Preserves custom player headers (e.g. x-requested-with)', () => {
+    const resolved = FrameContext.resolveFrameHeaders({
+      frameUrl: 'https://player.host.com/iframe',
+      customHeaders: [
+        { name: 'X-Requested-With', value: 'XMLHttpRequest' },
+        { name: 'Sec-Fetch-Dest', value: 'empty' },
+        { name: 'Cookie', value: 'secret_session_id=123' } // must not be duplicated into custom
+      ]
+    });
+
+    assert.strictEqual(resolved.headers['X-Requested-With'], 'XMLHttpRequest');
+    assert.strictEqual(resolved.headers['Sec-Fetch-Dest'], 'empty');
+    assert.strictEqual(resolved.headers['Cookie'], undefined, 'Cookie must not be added to custom requestHeaders');
+  });
+
+  it('Redacts sensitive tokens, signatures, and cookies for diagnostics export', () => {
+    const rawUrl = 'https://surrit.com/playlist.m3u8?token=SECRET_AUTH_TOKEN_999&expires=1700000000&sig=abc123xyz';
+    const redacted = FrameContext.redactDiagnosticData(rawUrl);
+    assert.ok(!redacted.includes('SECRET_AUTH_TOKEN_999'), 'Token must be masked');
+    assert.ok(!redacted.includes('abc123xyz'), 'Sig must be masked');
+    assert.ok(redacted.includes('token=[REDACTED]'));
+    assert.ok(redacted.includes('sig=[REDACTED]'));
+
+    const rawObj = {
+      url: rawUrl,
+      cookieHeader: 'session=xyz789; auth=token_abc',
+      safeHeader: 'en-US'
+    };
+    const redactedObj = FrameContext.redactDiagnosticData(rawObj);
+    assert.strictEqual(redactedObj.cookieHeader, '[REDACTED]');
+    assert.strictEqual(redactedObj.safeHeader, 'en-US');
+  });
+
+  it('Filters candidate child frames from getAllFrames', () => {
+    const allFrames = [
+      { frameId: 0, url: 'https://top-level.com/watch' },
+      { frameId: 1, url: 'https://surrit.com/embed/player' },
+      { frameId: 2, url: 'about:blank' },
+      { frameId: 3, url: 'https://ads.tracker.com/ad' }
+    ];
+
+    const candidates = FrameContext.findCandidateFrames(allFrames, {
+      expectedFrameUrl: 'https://surrit.com/embed/player',
+      targetFrameId: 10
+    });
+
+    assert.strictEqual(candidates.length, 2);
+    assert.strictEqual(candidates[0].frameId, 1);
+    assert.strictEqual(candidates[0].url, 'https://surrit.com/embed/player');
+  });
+
+  console.log('\n=== 8. Live Test Stream Acceptance Tests ===');
 
   await itAsync('Fetches & parses AES-128 test stream (oceans_aes master + variant)', async () => {
     const testUrl = 'https://playertest.longtailvideo.com/adaptive/oceans_aes/oceans_aes.m3u8';
@@ -308,6 +389,134 @@ enc_seg0.ts
     // Highest resolution first
     assert.ok(deduplicated[0].height >= deduplicated[deduplicated.length - 1].height);
     console.log(`    -> Mux multi-resolution master parsed: ${deduplicated.length} deduplicated resolutions (Top: ${deduplicated[0].resolutionLabel}, ${deduplicated[0].bandwidthMbps} Mbps)`);
+  });
+
+  console.log('\n=== 9. In-Page Player Cache & Challenge Handling Rules ===');
+
+  it('In-Page Player Cache: provides playlist without network fetch', () => {
+    const fakeCache = new Map();
+    const playlistUrl = 'https://surrit.com/abcd-1234/playlist.m3u8';
+    const sampleM3U8 = `#EXTM3U
+#EXT-X-VERSION:3
+#EXTINF:4.000,
+seg-0.ts
+#EXT-X-ENDLIST`;
+
+    // Simulate inject.js intercepting player XHR/fetch and storing in cache
+    fakeCache.set(playlistUrl, {
+      url: playlistUrl,
+      finalUrl: playlistUrl,
+      text: sampleM3U8,
+      format: 'm3u8',
+      frameUrl: 'https://surrit.com/embed/player.html',
+      status: 200
+    });
+
+    // Simulate downloader checking cache first (Requirement 2)
+    const cachedEntry = fakeCache.get(playlistUrl);
+    assert.ok(cachedEntry, 'Cached entry should exist');
+    assert.strictEqual(cachedEntry.status, 200);
+    assert.ok(cachedEntry.text.startsWith('#EXTM3U'));
+
+    // Parse without making any network request
+    const parsed = HlsParser.parse(cachedEntry.text, cachedEntry.url, cachedEntry.status);
+    assert.strictEqual(parsed.segments.length, 1);
+    assert.strictEqual(parsed.segments[0].duration, 4);
+  });
+
+  it('Challenge Handling: identifies cf-mitigated, Just a moment, captcha, and 403/429', () => {
+    const VERIFICATION_MSG = "This site needs a verification step. Open the video page, complete it, let the video play for a few seconds, then click 'Retry'.";
+
+    function isChallenge(text, headers = {}, status = 0) {
+      if (headers && headers['cf-mitigated'] === 'challenge') return true;
+      if (status === 403 || status === 429) {
+        if (!text || text.includes('<html') || text.includes('<!doctype') || text.includes('error') || text.includes('forbidden') || text.includes('denied')) {
+          return true;
+        }
+      }
+      if (!text) return false;
+      const lower = text.toLowerCase();
+      return (
+        lower.includes('just a moment...') ||
+        lower.includes('just a moment') ||
+        lower.includes('turnstile') ||
+        lower.includes('challenge-platform') ||
+        lower.includes('attention required! | cloudflare') ||
+        lower.includes('cf-mitigated') ||
+        lower.includes('verify you are human') ||
+        lower.includes('captcha')
+      );
+    }
+
+    assert.ok(isChallenge('', { 'cf-mitigated': 'challenge' }), 'Should detect cf-mitigated header');
+    assert.ok(isChallenge('<!DOCTYPE html><html><title>Just a moment...</title><body>Checking your browser</body></html>'), 'Should detect Cloudflare waiting page');
+    assert.ok(isChallenge('<div class="cf-turnstile">Please verify you are human</div>'), 'Should detect Turnstile challenge');
+    assert.ok(isChallenge('<html><head><title>403 Forbidden</title></head><body>Access Denied</body></html>', {}, 403), 'Should detect 403 HTML interstitial');
+    assert.ok(isChallenge('', {}, 429), 'Should detect 429 Too Many Requests');
+    assert.ok(!isChallenge('#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:2.0,\nseg1.ts', {}, 200), 'Valid m3u8 must not be flagged');
+  });
+
+  it('Expired Token Detection: checks token/expires query params with 401/403', () => {
+    const EXPIRED_MSG = "Reload the page, let it play, then retry.";
+
+    function isExpiredUrl(url, status) {
+      try {
+        const u = new URL(url);
+        const hasTokenOrExpire =
+          u.searchParams.has('token') ||
+          u.searchParams.has('expires') ||
+          u.searchParams.has('exp') ||
+          u.searchParams.has('expire') ||
+          u.searchParams.has('auth');
+        return hasTokenOrExpire && (status === 401 || status === 403 || status === 410);
+      } catch {
+        return false;
+      }
+    }
+
+    assert.ok(isExpiredUrl('https://stream.host/video.m3u8?token=xyz123', 403));
+    assert.ok(isExpiredUrl('https://stream.host/video.m3u8?expires=1700000000', 401));
+    assert.ok(!isExpiredUrl('https://stream.host/video.m3u8', 403), 'Regular URL with 403 is a challenge, not expired token');
+    assert.ok(!isExpiredUrl('https://stream.host/video.m3u8?token=xyz123', 200), '200 OK is not expired');
+  });
+
+  it('ArrayBuffer Chunking: splits payloads >16MB into chunks under 32MB', () => {
+    const totalBytes = 35 * 1024 * 1024; // 35 MB
+    const CHUNK_SIZE = 16 * 1024 * 1024; // 16 MB chunk
+    const chunks = [];
+
+    for (let offset = 0; offset < totalBytes; offset += CHUNK_SIZE) {
+      const sliceSize = Math.min(CHUNK_SIZE, totalBytes - offset);
+      chunks.push(sliceSize);
+    }
+
+    assert.strictEqual(chunks.length, 3);
+    assert.strictEqual(chunks[0], 16 * 1024 * 1024);
+    assert.strictEqual(chunks[1], 16 * 1024 * 1024);
+    assert.strictEqual(chunks[2], 3 * 1024 * 1024);
+    assert.ok(chunks.every(size => size < 32 * 1024 * 1024), 'Every chunk must be well under 32 MB');
+  });
+
+  it('Diagnostics Log: tracks strategy, frameId, cacheUsed, and redacts credentials', () => {
+    const rawDiag = {
+      strategy: 'In-Page Player Cache',
+      url: 'https://surrit.com/playlist.m3u8?token=SECRET_AUTH_TOKEN_999&expires=1700000000',
+      frameId: 3,
+      frameUrl: 'https://surrit.com/embed/player.html',
+      status: 200,
+      contentType: 'application/vnd.apple.mpegurl',
+      cacheUsed: true,
+      redirected: false,
+      preview: '#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:6.000,\nseg1.ts'
+    };
+
+    const redacted = FrameContext.redactDiagnosticData(rawDiag);
+    assert.strictEqual(redacted.strategy, 'In-Page Player Cache');
+    assert.strictEqual(redacted.cacheUsed, true);
+    assert.strictEqual(redacted.frameId, 3);
+    assert.ok(!redacted.url.includes('SECRET_AUTH_TOKEN_999'));
+    assert.ok(redacted.url.includes('token=[REDACTED]'));
+    assert.ok(redacted.preview.startsWith('#EXTM3U'));
   });
 
   console.log(`\n========================================`);

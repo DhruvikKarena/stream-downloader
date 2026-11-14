@@ -2,15 +2,20 @@
    Stream Downloader — Multi-Threaded HLS Engine (downloader.js)
    - Runs in extension page context (Blob, URL.createObjectURL, File System Access API)
    - Staged Pipeline Architecture:
-       1. Request Context & Header Replay (declarativeNetRequest scoped to TAB_ID_NONE)
-       2. Multi-tier Fetch Strategy Chain (Direct + Credentials -> Page-Context Fallback -> Challenge & Expiry Detection)
-       3. Pre-Download Resolution Picker (De-duplicated variants, audio renditions, subtitles, saved preferences)
-       4. Codec Detection (CODECS attribute parsing & MPEG-TS PMT stream ID inspection)
-       5. Segment Storage & AES-128 Decryption (IndexedDB keyed ${downloadId}:${index}, Web Crypto AES-CBC)
-       6. Transmuxing & In-Order Assembly (Single mux.js transmuxer, setBaseMediaDecodeTime on discontinuity)
-       7. FFmpeg.wasm Remuxing (PTS normalization, -movflags +faststart, moov duration repair, dual-track merge)
-       8. Duration Verification Sanity Check (Sum of #EXTINF vs final duration, 5% threshold warning)
-       9. Raw TS Fallback & Copyable Manual FFmpeg Command
+       1. Request Context & Frame Capture (webRequest onSendHeaders + webNavigation)
+       2. Multi-tier Fetch Strategy Chain (Stop at first valid #EXTM3U):
+          - Strategy A: Same-frame fetch (MAIN world -> ISOLATED world -> candidate frames)
+          - Strategy B: Frame content-script bridge ({ type: "FETCH", url, as })
+          - Strategy C: declarativeNetRequest Header Replay (scoped to TAB_ID_NONE & stream host)
+       3. Consistent Strategy Reuse for all key, init, and segment requests
+       4. Real-time Diagnostics Debug Panel & Redacted Debug Info Export
+       5. Pre-Download Resolution Picker (De-duplicated variants, audio renditions, subtitles)
+       6. Codec Detection (CODECS attribute parsing & MPEG-TS PMT stream ID inspection)
+       7. Segment Storage & AES-128 Decryption (IndexedDB keyed ${downloadId}:${index}, Web Crypto AES-CBC)
+       8. Transmuxing & In-Order Assembly (Single mux.js transmuxer, setBaseMediaDecodeTime on discontinuity)
+       9. FFmpeg.wasm Remuxing (PTS normalization, -movflags +faststart, moov duration repair, dual-track merge)
+       10. Duration Verification Sanity Check (Sum of #EXTINF vs final duration, 5% threshold warning)
+       11. Raw TS Fallback & Copyable Manual FFmpeg Command
    =================================================================== */
 
 (() => {
@@ -28,6 +33,17 @@
   let requestedFormat = (params.get('format') || 'mp4').toLowerCase();
   let currentTabId = parseInt(params.get('tabId') || '0', 10);
 
+  // Cross-origin iframe frame context parameters (Requirement 1)
+  let currentFrameId = parseInt(params.get('frameId') || '0', 10);
+  let currentFrameUrl = params.get('frameUrl') || '';
+  let currentInitiator = params.get('initiator') || '';
+  let currentCustomHeaders = [];
+  let currentOrigin = '';
+
+  // Working fetch strategy established during playlist probing (Requirement 2.D)
+  let workingStrategy = null; // 'same-frame' | 'content-script' | 'header-replay'
+  let workingFrameId = currentFrameId;
+
   // Unique session identifier for IndexedDB & DNR rule scoping
   const sessionDownloadId = 'dl_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
   const DNR_RULE_ID = Math.floor(Math.random() * 800000) + 100000;
@@ -35,7 +51,7 @@
   // Request context captured from background.js
   let currentRequestContext = null;
 
-  // Concurrency & Workers
+  // Concurrency & Workers (6 parallel default, up to 16 with Turbo)
   let concurrency = 6;
   let activeWorkers = 0;
   let abortController = new AbortController();
@@ -45,7 +61,6 @@
   let audioSegmentsList = [];
   let downloadedBuffers = {}; // In-memory buffer cache for drain fallback
   let segmentStatus = [];     // 'waiting' | 'active' | 'done' | 'error'
-  let audioSegmentStatus = [];
   let nextSegmentIndex = 0;
   let nextWriteIndex = 0;
   let retryCount = 0;
@@ -106,6 +121,9 @@
   let lastSpeedTime = 0;
   let currentSpeed = 0;
 
+  // Diagnostic Logs Array (Requirement 3)
+  const diagnosticLogs = [];
+
   // ---------------------------------------------------------------------------
   // 2. DOM Elements
   // ---------------------------------------------------------------------------
@@ -145,6 +163,7 @@
   const noticeBox = document.getElementById('notice-box');
   const noticeText = document.getElementById('notice-text');
   const retryBtn = document.getElementById('retry-btn');
+  const noticeCopyDebugBtn = document.getElementById('notice-copy-debug-btn');
 
   // Challenge & Expired Banners
   const challengeBanner = document.getElementById('challenge-banner');
@@ -176,6 +195,18 @@
   const sanityMessage = document.getElementById('sanity-message');
   const saveRawTsBtn = document.getElementById('save-raw-ts-btn');
 
+  // Diagnostics / Debug Panel Elements (Requirement 3)
+  const debugPanelCard = document.getElementById('debug-panel-card');
+  const debugToggleHeader = document.getElementById('debug-toggle-header');
+  const debugPanelBody = document.getElementById('debug-panel-body');
+  const debugStrategyBadge = document.getElementById('debug-strategy-badge');
+  const debugActiveStrategy = document.getElementById('debug-active-strategy');
+  const debugFrameContext = document.getElementById('debug-frame-context');
+  const debugDnrStatus = document.getElementById('debug-dnr-status');
+  const debugLogsContainer = document.getElementById('debug-logs-container');
+  const copyDebugBtn = document.getElementById('copy-debug-btn');
+  const debugArrow = document.getElementById('debug-arrow');
+
   // ---------------------------------------------------------------------------
   // 3. UI Helpers & Status Display
   // ---------------------------------------------------------------------------
@@ -200,11 +231,15 @@
     noticeBox.className = `notice-box ${type}`;
     noticeBox.classList.remove('hidden');
     if (retryBtn) retryBtn.classList.toggle('hidden', !showRetry);
+    if (noticeCopyDebugBtn && diagnosticLogs.length > 0) {
+      noticeCopyDebugBtn.classList.remove('hidden');
+    }
   }
 
   function hideNotice() {
     if (noticeBox) noticeBox.classList.add('hidden');
     if (retryBtn) retryBtn.classList.add('hidden');
+    if (noticeCopyDebugBtn) noticeCopyDebugBtn.classList.add('hidden');
   }
 
   function hideAllAlertBanners() {
@@ -324,7 +359,6 @@
     const diffPercent = (diffSec / expectedDuration) * 100;
 
     if (diffPercent > 5) {
-      // Differ by more than 5% -> WARN
       sanityBanner.className = 'alert-banner sanity-banner warning';
       if (sanityIcon) sanityIcon.textContent = '⚠️';
       if (sanityTitle) sanityTitle.textContent = `Duration Warning: ${diffPercent.toFixed(1)}% discrepancy detected!`;
@@ -336,7 +370,6 @@
       showNotice(`⚠️ Duration Warning: Output duration (${actualDuration.toFixed(1)}s) differs from #EXTINF playlist sum (${expectedDuration.toFixed(1)}s) by ${diffPercent.toFixed(1)}% (> 5%).`, 'error');
       console.warn(`[Sanity Check] Warning: Output duration ${actualDuration}s differs from expected ${expectedDuration}s by ${diffPercent.toFixed(1)}%`);
     } else {
-      // Within 5% -> Verified
       sanityBanner.className = 'alert-banner sanity-banner success';
       if (sanityIcon) sanityIcon.textContent = '✅';
       if (sanityTitle) sanityTitle.textContent = `Duration Verified (${diffPercent.toFixed(1)}% diff, within 5% threshold)`;
@@ -363,7 +396,117 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 4. Request Context & declarativeNetRequest Session Rules (Section A.1 & A.2)
+  // 4. Diagnostics & Logging (Requirement 3)
+  // ---------------------------------------------------------------------------
+  function redactSensitive(data) {
+    if (typeof FrameContext !== 'undefined' && FrameContext.redactDiagnosticData) {
+      return FrameContext.redactDiagnosticData(data);
+    }
+    if (typeof data !== 'string') return data;
+    return data
+      .replace(/([?&](?:token|expires|exp|auth|sig|signature|key|session)=)[^&#\s]+/gi, '$1[REDACTED]')
+      .replace(/bearer\s+[a-zA-Z0-9_\-\.]+/gi, 'Bearer [REDACTED]')
+      .replace(/cookie:\s*[^;\r\n]+/gi, 'Cookie: [REDACTED]');
+  }
+
+  function logDiagnostic(entry) {
+    const item = {
+      ...entry,
+      timestamp: new Date().toLocaleTimeString()
+    };
+    diagnosticLogs.push(item);
+    renderDebugEntry(item);
+    console.log(`[Diagnostic] [${item.strategy}] ${item.url} -> HTTP ${item.status || 'ERR'} (${item.contentType || ''})`, item);
+  }
+
+  function renderDebugEntry(item) {
+    if (!debugLogsContainer) return;
+    const emptyMsg = debugLogsContainer.querySelector('.debug-empty-msg');
+    if (emptyMsg) emptyMsg.remove();
+
+    const el = document.createElement('div');
+    const isOk = item.ok && (item.status >= 200 && item.status < 300);
+    el.className = `debug-log-entry ${isOk ? 'success' : 'failed'}`;
+
+    const cleanUrl = redactSensitive(item.url || '');
+    const preview = item.preview ? redactSensitive(item.preview.slice(0, 200)) : '';
+
+    el.innerHTML = `
+      <div class="debug-log-header">
+        <span class="debug-log-strat">${item.strategy}</span>
+        <span class="debug-log-status status-${item.status || 'err'}">HTTP ${item.status || 'ERR'}${item.statusText ? ' ' + item.statusText : ''}</span>
+      </div>
+      <div class="debug-log-url">${cleanUrl}</div>
+      <div class="debug-log-details">
+        <div><strong>Frame:</strong> id=${item.frameId !== undefined ? item.frameId : '0'}, url=${item.frameUrl ? redactSensitive(item.frameUrl) : 'top-level'}</div>
+        <div><strong>Cache Used:</strong> ${item.cacheUsed ? '<span class="badge-cache">YES (In-Page)</span>' : 'NO (Network)'}</div>
+        <div><strong>Content-Type:</strong> ${item.contentType || 'unknown'}, <strong>Final URL:</strong> ${item.finalUrl ? redactSensitive(item.finalUrl) : 'same'}, <strong>Redirected:</strong> ${!!item.redirected}</div>
+        ${item.sentHeaders && Object.keys(item.sentHeaders).length > 0 ? `<div><strong>Headers Sent:</strong> ${redactSensitive(JSON.stringify(item.sentHeaders))}</div>` : ''}
+        ${item.dnrMatched !== undefined ? `<div><strong>DNR Rule Match:</strong> ${item.dnrMatched ? 'YES (Rule ' + item.ruleId + ' fired)' : 'NO'}</div>` : ''}
+        ${preview ? `<div class="debug-log-preview">${preview}</div>` : ''}
+      </div>
+    `;
+    debugLogsContainer.appendChild(el);
+    debugLogsContainer.scrollTop = debugLogsContainer.scrollHeight;
+  }
+
+  function updateDebugActiveStrategy(strat) {
+    if (debugActiveStrategy) debugActiveStrategy.textContent = strat;
+    if (debugStrategyBadge) {
+      debugStrategyBadge.textContent = strat.toUpperCase();
+      debugStrategyBadge.style.background = '#00c853';
+    }
+  }
+
+  function copyDebugInfo() {
+    const report = {
+      generatedAt: new Date().toISOString(),
+      streamUrl: redactSensitive(playlistUrl),
+      tabId: currentTabId,
+      resolvedFrameId: workingFrameId !== undefined ? workingFrameId : currentFrameId,
+      resolvedFrameUrl: redactSensitive(currentFrameUrl),
+      workingStrategy: workingStrategy || 'none',
+      capturedContext: currentRequestContext ? {
+        frameId: currentRequestContext.frameId,
+        frameUrl: redactSensitive(currentRequestContext.frameUrl),
+        initiator: redactSensitive(currentRequestContext.initiator),
+        referer: redactSensitive(currentRequestContext.referer),
+        origin: redactSensitive(currentRequestContext.origin),
+        userAgent: currentRequestContext.userAgent,
+        acceptLanguage: currentRequestContext.acceptLanguage,
+        hasCookie: currentRequestContext.hasCookie,
+        customHeaders: currentRequestContext.customHeaders
+      } : null,
+      attempts: diagnosticLogs.map(l => ({
+        strategy: l.strategy,
+        url: redactSensitive(l.url),
+        status: l.status,
+        contentType: l.contentType,
+        frameId: l.frameId,
+        frameUrl: redactSensitive(l.frameUrl),
+        redirected: !!l.redirected,
+        cacheUsed: !!l.cacheUsed,
+        sentHeaders: l.sentHeaders ? redactSensitive(JSON.stringify(l.sentHeaders)) : null,
+        dnrMatched: l.dnrMatched,
+        preview: l.preview ? redactSensitive(l.preview.slice(0, 200)) : '',
+        error: l.error || null,
+        timestamp: l.timestamp
+      }))
+    };
+
+    const jsonStr = JSON.stringify(report, null, 2);
+    navigator.clipboard.writeText(jsonStr).then(() => {
+      if (copyDebugBtn) copyDebugBtn.textContent = 'Copied!';
+      if (noticeCopyDebugBtn) noticeCopyDebugBtn.textContent = 'Copied!';
+      setTimeout(() => {
+        if (copyDebugBtn) copyDebugBtn.textContent = 'Copy Debug Info';
+        if (noticeCopyDebugBtn) noticeCopyDebugBtn.textContent = 'Copy Debug Info';
+      }, 2500);
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // 5. Request Context & declarativeNetRequest Session Rules (Requirement 1 & 2.C)
   // ---------------------------------------------------------------------------
   async function initRequestContext(url) {
     try {
@@ -378,9 +521,28 @@
         if (!refererUrl && res.context.referer) {
           refererUrl = res.context.referer;
         }
+        if (res.context.frameId !== undefined && !params.get('frameId')) {
+          currentFrameId = res.context.frameId;
+        }
+        if (res.context.frameUrl && !currentFrameUrl) {
+          currentFrameUrl = res.context.frameUrl;
+        }
+        if (res.context.initiator && !currentInitiator) {
+          currentInitiator = res.context.initiator;
+        }
+        if (Array.isArray(res.context.customHeaders)) {
+          currentCustomHeaders = res.context.customHeaders;
+        }
       }
     } catch (err) {
       console.warn('[Request Context] Could not get context from background:', err);
+    }
+
+    if (debugFrameContext) {
+      const fInfo = currentFrameUrl
+        ? `Frame ${currentFrameId} (${currentFrameUrl})`
+        : (currentFrameId > 0 ? `Frame ${currentFrameId}` : 'Top-Level Tab');
+      debugFrameContext.textContent = redactSensitive(fInfo);
     }
 
     await applyRequestHeaders(url);
@@ -389,25 +551,46 @@
   async function applyRequestHeaders(url) {
     try {
       const targetUrl = url || playlistUrl;
-      const referer = (currentRequestContext && currentRequestContext.referer) || refererUrl || '';
-      let origin = (currentRequestContext && currentRequestContext.origin) || '';
-      if (!origin && referer) {
-        try { origin = new URL(referer).origin; } catch {}
-      }
-      const userAgent = (currentRequestContext && currentRequestContext.userAgent) || '';
-      const acceptLanguage = (currentRequestContext && currentRequestContext.acceptLanguage) || '';
+
+      // Prioritize frameUrl / initiator over top-level tab URL (Requirement 1 & 2.C)
+      const resolved = (typeof FrameContext !== 'undefined')
+        ? FrameContext.resolveFrameHeaders({
+            frameUrl: currentFrameUrl,
+            initiator: currentInitiator,
+            tabUrl: (currentRequestContext && currentRequestContext.pageUrl) || refererUrl,
+            rawReferer: (currentRequestContext && currentRequestContext.rawReferer) || refererUrl,
+            rawOrigin: (currentRequestContext && currentRequestContext.rawOrigin) || '',
+            userAgent: (currentRequestContext && currentRequestContext.userAgent) || '',
+            acceptLanguage: (currentRequestContext && currentRequestContext.acceptLanguage) || '',
+            accept: (currentRequestContext && currentRequestContext.accept) || '',
+            customHeaders: currentCustomHeaders
+          })
+        : {
+            referer: currentFrameUrl || refererUrl,
+            origin: (currentFrameUrl ? new URL(currentFrameUrl).origin : '') || '',
+            headers: {}
+          };
+
+      currentOrigin = resolved.origin;
 
       await new Promise((resolve) => {
         chrome.runtime.sendMessage({
           action: 'setDownloadHeaders',
           ruleId: DNR_RULE_ID,
           url: targetUrl,
-          referer,
-          origin,
-          userAgent,
-          acceptLanguage
+          frameUrl: currentFrameUrl,
+          referer: resolved.referer,
+          origin: resolved.origin,
+          userAgent: (currentRequestContext && currentRequestContext.userAgent) || '',
+          acceptLanguage: (currentRequestContext && currentRequestContext.acceptLanguage) || '',
+          accept: (currentRequestContext && currentRequestContext.accept) || '',
+          customHeaders: currentCustomHeaders
         }, resolve);
       });
+
+      if (debugDnrStatus) {
+        debugDnrStatus.textContent = `Installed (Rule ${DNR_RULE_ID})`;
+      }
     } catch (err) {
       console.warn('[DNR] Error setting download headers:', err);
     }
@@ -421,6 +604,7 @@
           ruleId: DNR_RULE_ID
         }, resolve);
       });
+      if (debugDnrStatus) debugDnrStatus.textContent = 'Cleared';
     } catch {}
   }
 
@@ -432,19 +616,49 @@
   });
 
   // ---------------------------------------------------------------------------
-  // 5. Fetch Strategy Chain (Section A.1 - A.8)
+  // 6. Fetch Strategy Chain (Stop at first valid #EXTM3U)
   // ---------------------------------------------------------------------------
-  function isChallengeResponse(text) {
+  const VERIFICATION_MSG = "This site needs a verification step. Open the video page, complete it, let the video play for a few seconds, then click 'Retry'.";
+  const EXPIRED_MSG = "Reload the page, let it play, then retry.";
+
+  function isChallengeResponse(text, headers = {}, status = 0) {
+    if (headers && headers['cf-mitigated'] === 'challenge') return true;
+    if (status === 403 || status === 429) {
+      if (!text || text.includes('<html') || text.includes('<!doctype') || text.includes('error') || text.includes('forbidden') || text.includes('denied')) {
+        return true;
+      }
+    }
     if (!text) return false;
     const lower = text.toLowerCase();
-    return (
+    if (
       lower.includes('just a moment...') ||
+      lower.includes('just a moment') ||
       lower.includes('turnstile') ||
       lower.includes('challenge-platform') ||
       lower.includes('attention required! | cloudflare') ||
       lower.includes('cf-mitigated') ||
-      (lower.includes('verify you are human') && lower.includes('captcha'))
-    );
+      lower.includes('verify you are human') ||
+      lower.includes('verify that you are a human') ||
+      lower.includes('recaptcha') ||
+      lower.includes('hcaptcha') ||
+      lower.includes('captcha') ||
+      lower.includes('security check') ||
+      lower.includes('bot detection') ||
+      lower.includes('checking your browser') ||
+      lower.includes('enable javascript and cookies')
+    ) {
+      return true;
+    }
+    if ((lower.includes('<!doctype html') || lower.includes('<html')) && (
+      lower.includes('access denied') ||
+      lower.includes('forbidden') ||
+      lower.includes('challenge') ||
+      lower.includes('block') ||
+      lower.includes('verification')
+    )) {
+      return true;
+    }
+    return false;
   }
 
   function checkExpiredUrl(url, status) {
@@ -457,7 +671,7 @@
         u.searchParams.has('expire') ||
         u.searchParams.has('auth');
       if (hasTokenOrExpire && (status === 401 || status === 403 || status === 410)) {
-        triggerExpiredDetected();
+        triggerExpiredDetected(EXPIRED_MSG);
         return true;
       }
     } catch {}
@@ -465,168 +679,561 @@
   }
 
   function triggerChallengeDetected(customMsg) {
+    const msg = customMsg || VERIFICATION_MSG;
     if (challengeBanner) {
-      if (customMsg && challengeMessage) challengeMessage.textContent = customMsg;
+      if (challengeMessage) challengeMessage.textContent = msg;
       challengeBanner.classList.remove('hidden');
     }
-    setStatus('Bot Challenge Detected', false);
-    updatePipelineStep('error', 'Bot Challenge Block');
-    showNotice('This site is blocking automated downloads (bot challenge). Open the video page, let it play for a few seconds, then try again.', 'error', true);
+    setStatus('Verification Required', false);
+    updatePipelineStep('error', 'Verification Required');
+    showNotice(msg, 'error', true);
   }
 
   function triggerExpiredDetected(customMsg) {
+    const msg = customMsg || EXPIRED_MSG;
     if (expiredBanner) {
-      if (customMsg && expiredMessage) expiredMessage.textContent = customMsg;
+      if (expiredMessage) expiredMessage.textContent = msg;
       expiredBanner.classList.remove('hidden');
     }
     setStatus('Token Expired', false);
     updatePipelineStep('error', 'Token Expired');
-    showNotice('The media stream URL has expired or has an invalid authentication token. Please refresh the video page and click Download again.', 'error', true);
+    showNotice(msg, 'error', true);
+  }
+
+  async function getCachedPlaylist(url) {
+    if (!chrome.runtime || !chrome.runtime.sendMessage) return null;
+    return new Promise((resolve) => {
+      chrome.runtime.sendMessage({ action: 'getCachedPlaylist', url }, (res) => {
+        if (chrome.runtime.lastError || !res || !res.success || !res.cached) {
+          resolve(null);
+        } else {
+          resolve(res.entry);
+        }
+      });
+    });
   }
 
   /**
-   * Fetch with staged strategy chain:
-   * 1. Direct fetch with credentials: "include" and DNR session headers
-   * 2. Fallback to chrome.scripting page-context fetch (world: "MAIN") on 403 or HTML block
-   * 3. Response validation: strip BOM, check #EXTM3U, detect bot challenges, check token expiry
+   * Execute a single named strategy attempt.
    */
-  async function fetchWithStrategy(url, options = {}) {
-    const {
-      responseType = 'text', // 'text' | 'arraybuffer'
-      isPlaylist = false,
-      headers = {},
-      signal = abortController.signal,
-      allowPageFallback = true,
-      allowTokenRetry = true
-    } = options;
+  async function executeStrategy(strat, url, options = {}) {
+    const { responseType = 'text', isPlaylist = false, headers = {}, signal = abortController.signal } = options;
 
-    let directRes = null;
-    let fetchError = null;
-
-    try {
-      directRes = await fetch(url, {
-        method: 'GET',
-        headers,
-        signal,
-        credentials: 'include'
+    if (strat === 'same-frame') {
+      // Strategy A: Same-frame fetch in MAIN world with fallback to ISOLATED (Requirement 2.A)
+      const targetFrame = workingFrameId !== undefined ? workingFrameId : currentFrameId;
+      const res = await new Promise(resolve => {
+        chrome.runtime.sendMessage({
+          action: 'fetchFromPageContext',
+          tabId: currentTabId,
+          frameId: targetFrame,
+          frameUrl: currentFrameUrl,
+          initiator: currentInitiator,
+          url,
+          responseType: (responseType === 'arraybuffer' ? 'bytes' : 'text')
+        }, resolve);
       });
-    } catch (err) {
-      fetchError = err;
-      if (err.name === 'AbortError' || isCancelled) throw err;
-    }
 
-    let shouldTryPageFallback = false;
-    if (!directRes || !directRes.ok) {
-      const status = directRes ? directRes.status : 0;
-      if (status === 403 || status === 401 || status === 429 || status === 0 || !directRes) {
-        shouldTryPageFallback = true;
+      if (!res || !res.success || !res.result) {
+        logDiagnostic({
+          strategy: 'same-frame',
+          url,
+          frameId: targetFrame,
+          frameUrl: currentFrameUrl,
+          sentHeaders: { Referer: currentFrameUrl || 'location.href', credentials: 'include' },
+          status: 0,
+          statusText: 'Frame execution failed',
+          contentType: '',
+          error: res ? res.error : 'No response',
+          cacheUsed: false,
+          ok: false
+        });
+        return { ok: false, status: 0, error: res ? res.error : 'Execution failed' };
       }
-    }
 
-    let directText = null;
-    if (directRes && directRes.ok) {
-      const cfMitigated = directRes.headers.get('cf-mitigated');
-      if (cfMitigated === 'challenge') {
-        triggerChallengeDetected();
-        throw new Error('Bot challenge detected (cf-mitigated: challenge)');
+      const pr = res.result;
+      const isOk = pr.ok && (pr.status >= 200 && pr.status < 300);
+
+      // 1. Check expired URL first
+      if (checkExpiredUrl(url, pr.status)) {
+        const err = new Error(EXPIRED_MSG);
+        err.isExpired = true;
+        throw err;
+      }
+
+      // 2. Treat header cf-mitigated: challenge as challenge
+      if (pr.headers && pr.headers['cf-mitigated'] === 'challenge') {
+        triggerChallengeDetected(VERIFICATION_MSG);
+        const err = new Error(VERIFICATION_MSG);
+        err.isChallenge = true;
+        throw err;
+      }
+
+      // 3. Persistent 403 or 429 after same-frame fetch is treated as verification challenge
+      if (pr.status === 403 || pr.status === 429) {
+        triggerChallengeDetected(VERIFICATION_MSG);
+        const err = new Error(VERIFICATION_MSG);
+        err.isChallenge = true;
+        throw err;
       }
 
       if (responseType === 'text' || isPlaylist) {
-        directText = await directRes.text();
-        if (directText.charCodeAt(0) === 0xFEFF) directText = directText.slice(1);
-        directText = directText.trim();
+        let text = pr.text || '';
+        if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+        text = text.trim();
 
-        if (isChallengeResponse(directText)) {
-          triggerChallengeDetected();
-          throw new Error('This site is blocking automated downloads (bot challenge). Open the video page, let it play for a few seconds, then try again.');
+        if (isChallengeResponse(text, pr.headers, pr.status)) {
+          triggerChallengeDetected(VERIFICATION_MSG);
+          const err = new Error(VERIFICATION_MSG);
+          err.isChallenge = true;
+          throw err;
         }
 
-        if (isPlaylist && !directText.startsWith('#EXTM3U')) {
-          shouldTryPageFallback = true;
-        } else {
-          return { ok: true, status: directRes.status, text: directText, url: directRes.url };
-        }
-      } else {
-        const directBytes = await directRes.arrayBuffer();
-        return { ok: true, status: directRes.status, buffer: directBytes, url: directRes.url };
-      }
-    }
+        const validPlaylist = !isPlaylist || text.startsWith('#EXTM3U');
 
-    // Step 4: Page-Context Fallback (Section A.4)
-    if (shouldTryPageFallback && allowPageFallback && currentTabId > 0) {
-      console.log(`[Fetch Strategy] Direct fetch status ${directRes ? directRes.status : 'ERR'}. Attempting page-context fallback via tab ${currentTabId}...`);
-      try {
-        const pageResult = await new Promise((resolve) => {
-          chrome.runtime.sendMessage({
-            action: 'fetchFromPageContext',
-            tabId: currentTabId,
-            url,
-            responseType: (responseType === 'arraybuffer' ? 'bytes' : 'text')
-          }, resolve);
+        logDiagnostic({
+          strategy: `same-frame (${res.world || 'MAIN'})`,
+          url,
+          frameId: res.frameId !== undefined ? res.frameId : targetFrame,
+          frameUrl: pr.frameLocation || currentFrameUrl,
+          sentHeaders: { Referer: pr.frameLocation || currentFrameUrl, credentials: 'include' },
+          status: pr.status,
+          statusText: pr.statusText,
+          contentType: pr.contentType || (pr.headers && pr.headers['content-type']) || '',
+          finalUrl: pr.url || url,
+          redirected: pr.redirected,
+          preview: text,
+          cacheUsed: false,
+          ok: isOk && validPlaylist
         });
 
-        if (pageResult && pageResult.success && pageResult.result) {
-          const pr = pageResult.result;
-          if (pr.headers && pr.headers['cf-mitigated'] === 'challenge') {
-            triggerChallengeDetected();
-            throw new Error('Bot challenge detected (cf-mitigated: challenge)');
+        if (isOk && validPlaylist) {
+          workingFrameId = res.frameId !== undefined ? res.frameId : targetFrame;
+          return { ok: true, status: pr.status, text, url: pr.url || url };
+        }
+        return { ok: false, status: pr.status, text, url: pr.url || url };
+      } else {
+        // Binary bytes: assemble chunks if split, or decode base64
+        let bytes;
+        if (pr.chunks && Array.isArray(pr.chunks)) {
+          const parts = pr.chunks.map(c => atob(c));
+          const totalLen = parts.reduce((acc, p) => acc + p.length, 0);
+          bytes = new Uint8Array(totalLen);
+          let offset = 0;
+          for (const part of parts) {
+            for (let i = 0; i < part.length; i++) {
+              bytes[offset++] = part.charCodeAt(i);
+            }
           }
-
-          if (responseType === 'text' || isPlaylist) {
-            let text = pr.text || '';
-            if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-            text = text.trim();
-
-            if (isChallengeResponse(text)) {
-              triggerChallengeDetected();
-              throw new Error('This site is blocking automated downloads (bot challenge). Open the video page, let it play for a few seconds, then try again.');
-            }
-
-            if (isPlaylist && !text.startsWith('#EXTM3U')) {
-              checkExpiredUrl(url, pr.status);
-              const preview = text.slice(0, 200).replace(/\s+/g, ' ');
-              throw new Error(`Server returned HTTP ${pr.status}: "${preview}" (Page-context fetch returned invalid #EXTM3U)`);
-            }
-
-            return { ok: pr.ok, status: pr.status, text, url: pr.url || url };
-          } else {
-            const base64 = pr.base64 || '';
-            const binStr = atob(base64);
-            const len = binStr.length;
-            const bytes = new Uint8Array(len);
-            for (let i = 0; i < len; i++) {
-              bytes[i] = binStr.charCodeAt(i);
-            }
-            return { ok: pr.ok, status: pr.status, buffer: bytes.buffer, url: pr.url || url };
+        } else {
+          const base64 = pr.base64 || '';
+          const binStr = atob(base64);
+          const len = binStr.length;
+          bytes = new Uint8Array(len);
+          for (let i = 0; i < len; i++) {
+            bytes[i] = binStr.charCodeAt(i);
           }
         }
-      } catch (pageErr) {
-        console.warn('[Fetch Strategy] Page fallback exception:', pageErr);
+
+        logDiagnostic({
+          strategy: `same-frame (${res.world || 'MAIN'})`,
+          url,
+          frameId: res.frameId !== undefined ? res.frameId : targetFrame,
+          frameUrl: pr.frameLocation || currentFrameUrl,
+          sentHeaders: { Referer: pr.frameLocation || currentFrameUrl, credentials: 'include' },
+          status: pr.status,
+          statusText: pr.statusText,
+          contentType: pr.contentType || (pr.headers && pr.headers['content-type']) || '',
+          finalUrl: pr.url || url,
+          redirected: pr.redirected,
+          preview: `[Binary data: ${bytes.byteLength} bytes]`,
+          cacheUsed: false,
+          ok: isOk
+        });
+
+        if (isOk) {
+          workingFrameId = res.frameId !== undefined ? res.frameId : targetFrame;
+          return { ok: true, status: pr.status, buffer: bytes.buffer, url: pr.url || url };
+        }
+        return { ok: false, status: pr.status, buffer: bytes.buffer, url: pr.url || url };
       }
     }
 
-    const finalStatus = directRes ? directRes.status : 0;
-    if (checkExpiredUrl(url, finalStatus)) {
-      throw new Error('The media stream URL has expired or has an invalid authentication token. Please refresh the video page and click Download again.');
+    if (strat === 'content-script') {
+      // Strategy B: Frame content-script fetch (Requirement 2.B)
+      const targetFrame = workingFrameId !== undefined ? workingFrameId : currentFrameId;
+      const res = await new Promise(resolve => {
+        chrome.runtime.sendMessage({
+          action: 'fetchFromContentScript',
+          tabId: currentTabId,
+          frameId: targetFrame,
+          url,
+          responseType: (responseType === 'arraybuffer' ? 'bytes' : 'text'),
+          headers
+        }, resolve);
+      });
+
+      if (!res || !res.success || !res.result) {
+        logDiagnostic({
+          strategy: 'content-script',
+          url,
+          frameId: targetFrame,
+          frameUrl: currentFrameUrl,
+          sentHeaders: { Referer: currentFrameUrl || 'location.href', ...headers },
+          status: 0,
+          statusText: 'Content script unreachable',
+          contentType: '',
+          error: res ? res.error : 'No response',
+          cacheUsed: false,
+          ok: false
+        });
+        return { ok: false, status: 0, error: res ? res.error : 'Content script failed' };
+      }
+
+      const cr = res.result;
+      const isOk = cr.ok && (cr.status >= 200 && cr.status < 300);
+
+      // Check expired token URL
+      if (checkExpiredUrl(url, cr.status)) {
+        const err = new Error(EXPIRED_MSG);
+        err.isExpired = true;
+        throw err;
+      }
+
+      // Check challenge
+      if (cr.headers && cr.headers['cf-mitigated'] === 'challenge') {
+        triggerChallengeDetected(VERIFICATION_MSG);
+        const err = new Error(VERIFICATION_MSG);
+        err.isChallenge = true;
+        throw err;
+      }
+
+      if (responseType === 'text' || isPlaylist) {
+        let text = cr.text || '';
+        if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+        text = text.trim();
+
+        if (isChallengeResponse(text, cr.headers, cr.status)) {
+          triggerChallengeDetected(VERIFICATION_MSG);
+          const err = new Error(VERIFICATION_MSG);
+          err.isChallenge = true;
+          throw err;
+        }
+
+        const validPlaylist = !isPlaylist || text.startsWith('#EXTM3U');
+
+        logDiagnostic({
+          strategy: 'content-script',
+          url,
+          frameId: res.frameId !== undefined ? res.frameId : targetFrame,
+          frameUrl: cr.frameUrl || currentFrameUrl,
+          sentHeaders: { Referer: cr.frameUrl || currentFrameUrl, ...headers },
+          status: cr.status,
+          statusText: cr.statusText,
+          contentType: cr.contentType || '',
+          finalUrl: cr.url || url,
+          redirected: cr.redirected,
+          preview: text,
+          cacheUsed: false,
+          ok: isOk && validPlaylist
+        });
+
+        if (isOk && validPlaylist) {
+          workingFrameId = res.frameId !== undefined ? res.frameId : targetFrame;
+          return { ok: true, status: cr.status, text, url: cr.url || url };
+        }
+        return { ok: false, status: cr.status, text, url: cr.url || url };
+      } else {
+        let bytes;
+        if (cr.chunks && Array.isArray(cr.chunks)) {
+          const parts = cr.chunks.map(c => atob(c));
+          const totalLen = parts.reduce((acc, p) => acc + p.length, 0);
+          bytes = new Uint8Array(totalLen);
+          let offset = 0;
+          for (const part of parts) {
+            for (let i = 0; i < part.length; i++) {
+              bytes[offset++] = part.charCodeAt(i);
+            }
+          }
+        } else {
+          const base64 = cr.base64 || '';
+          const binStr = atob(base64);
+          const len = binStr.length;
+          bytes = new Uint8Array(len);
+          for (let i = 0; i < len; i++) {
+            bytes[i] = binStr.charCodeAt(i);
+          }
+        }
+
+        logDiagnostic({
+          strategy: 'content-script',
+          url,
+          frameId: res.frameId !== undefined ? res.frameId : targetFrame,
+          frameUrl: cr.frameUrl || currentFrameUrl,
+          sentHeaders: { Referer: cr.frameUrl || currentFrameUrl, ...headers },
+          status: cr.status,
+          statusText: cr.statusText,
+          contentType: cr.contentType || '',
+          finalUrl: cr.url || url,
+          redirected: cr.redirected,
+          preview: `[Binary data: ${bytes.byteLength} bytes]`,
+          cacheUsed: false,
+          ok: isOk
+        });
+
+        if (isOk) {
+          workingFrameId = res.frameId !== undefined ? res.frameId : targetFrame;
+          return { ok: true, status: cr.status, buffer: bytes.buffer, url: cr.url || url };
+        }
+        return { ok: false, status: cr.status, buffer: bytes.buffer, url: cr.url || url };
+      }
     }
 
-    if (allowTokenRetry) {
-      console.log('[Fetch Strategy] Retrying once with fresh request context...');
-      await initRequestContext(url);
-      return await fetchWithStrategy(url, { ...options, allowTokenRetry: false });
+    if (strat === 'header-replay') {
+      // Strategy C: declarativeNetRequest Header Replay (Requirement 2.C)
+      await applyRequestHeaders(url);
+
+      let directRes;
+      try {
+        directRes = await fetch(url, {
+          method: 'GET',
+          headers,
+          signal,
+          credentials: 'include'
+        });
+      } catch (fErr) {
+        logDiagnostic({
+          strategy: 'header-replay',
+          url,
+          frameId: -1,
+          frameUrl: currentFrameUrl || refererUrl,
+          sentHeaders: {
+            Referer: currentFrameUrl || refererUrl,
+            Origin: currentOrigin,
+            'User-Agent': (currentRequestContext && currentRequestContext.userAgent) || '',
+            ...headers
+          },
+          status: 0,
+          statusText: fErr.name || 'NetworkError',
+          contentType: '',
+          error: fErr.message,
+          cacheUsed: false,
+          ok: false
+        });
+        return { ok: false, status: 0, error: fErr.message };
+      }
+
+      // Check matched rules from background (Requirement 2.C & 3)
+      let dnrMatched = false;
+      try {
+        const matchedCheck = await new Promise(resolve => {
+          chrome.runtime.sendMessage({ action: 'getMatchedRules' }, resolve);
+        });
+        if (matchedCheck && matchedCheck.success && Array.isArray(matchedCheck.rulesMatchedInfo)) {
+          dnrMatched = matchedCheck.rulesMatchedInfo.some(r => r.rule && r.rule.ruleId === DNR_RULE_ID);
+        }
+      } catch (_) {}
+
+      if (debugDnrStatus) {
+        debugDnrStatus.textContent = dnrMatched ? `Rule ${DNR_RULE_ID} Fired (Active)` : `Installed (Rule ${DNR_RULE_ID})`;
+      }
+
+      // Check expired URL first
+      if (checkExpiredUrl(url, directRes.status)) {
+        const err = new Error(EXPIRED_MSG);
+        err.isExpired = true;
+        throw err;
+      }
+
+      const cfMitigated = directRes.headers.get('cf-mitigated');
+      if (cfMitigated === 'challenge') {
+        triggerChallengeDetected(VERIFICATION_MSG);
+        const err = new Error(VERIFICATION_MSG);
+        err.isChallenge = true;
+        throw err;
+      }
+
+      const isOk = directRes.ok;
+
+      if (responseType === 'text' || isPlaylist) {
+        let text = await directRes.text();
+        if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+        text = text.trim();
+
+        if (isChallengeResponse(text, {}, directRes.status)) {
+          triggerChallengeDetected(VERIFICATION_MSG);
+          const err = new Error(VERIFICATION_MSG);
+          err.isChallenge = true;
+          throw err;
+        }
+
+        const validPlaylist = !isPlaylist || text.startsWith('#EXTM3U');
+
+        logDiagnostic({
+          strategy: 'header-replay',
+          url,
+          frameId: -1,
+          frameUrl: currentFrameUrl || refererUrl,
+          sentHeaders: {
+            Referer: currentFrameUrl || refererUrl,
+            Origin: currentOrigin,
+            'User-Agent': (currentRequestContext && currentRequestContext.userAgent) || '',
+            ...headers
+          },
+          status: directRes.status,
+          statusText: directRes.statusText,
+          contentType: directRes.headers.get('content-type') || '',
+          finalUrl: directRes.url,
+          redirected: directRes.redirected,
+          dnrMatched,
+          ruleId: DNR_RULE_ID,
+          preview: text,
+          cacheUsed: false,
+          ok: isOk && validPlaylist
+        });
+
+        if (isOk && validPlaylist) {
+          return { ok: true, status: directRes.status, text, url: directRes.url };
+        }
+        return { ok: false, status: directRes.status, text, url: directRes.url };
+      } else {
+        const buf = await directRes.arrayBuffer();
+
+        logDiagnostic({
+          strategy: 'header-replay',
+          url,
+          frameId: -1,
+          frameUrl: currentFrameUrl || refererUrl,
+          sentHeaders: {
+            Referer: currentFrameUrl || refererUrl,
+            Origin: currentOrigin,
+            'User-Agent': (currentRequestContext && currentRequestContext.userAgent) || '',
+            ...headers
+          },
+          status: directRes.status,
+          statusText: directRes.statusText,
+          contentType: directRes.headers.get('content-type') || '',
+          finalUrl: directRes.url,
+          redirected: directRes.redirected,
+          dnrMatched,
+          ruleId: DNR_RULE_ID,
+          preview: `[Binary data: ${buf.byteLength} bytes]`,
+          cacheUsed: false,
+          ok: isOk
+        });
+
+        if (isOk) {
+          return { ok: true, status: directRes.status, buffer: buf, url: directRes.url };
+        }
+        return { ok: false, status: directRes.status, buffer: buf, url: directRes.url };
+      }
     }
 
-    if (directRes) {
-      const contentType = directRes.headers.get('content-type') || 'unknown';
-      const preview = directText ? directText.slice(0, 200).replace(/\s+/g, ' ') : '';
-      throw new Error(`Failed to load valid playlist. HTTP ${directRes.status} (${directRes.statusText}), Content-Type: ${contentType}, Final URL: ${directRes.url}. Response preview: "${preview}"`);
+    throw new Error(`Unknown fetch strategy: ${strat}`);
+  }
+
+  /**
+   * Staged Strategy Chain:
+   * Probes strategies in order (Cache -> A -> B -> C) until first valid #EXTM3U is returned.
+   * Once proven, locks in workingStrategy for all subsequent key, init, and segment fetches (Requirement 2.D).
+   */
+  async function fetchWithStrategy(url, options = {}) {
+    const {
+      responseType = 'text',
+      isPlaylist = false,
+      headers = {},
+      signal = abortController.signal
+    } = options;
+
+    // Requirement 2: Reuse what the player already loaded first!
+    if (isPlaylist) {
+      try {
+        const cached = await getCachedPlaylist(url);
+        if (cached && cached.text) {
+          let text = cached.text;
+          if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+          text = text.trim();
+          if (text.startsWith('#EXTM3U') || text.includes('<MPD')) {
+            console.log('[Fetch Strategy] Using cached playlist from player session (zero network requests):', url);
+            logDiagnostic({
+              strategy: 'In-Page Player Cache',
+              url,
+              frameId: currentFrameId,
+              frameUrl: cached.frameUrl || currentFrameUrl,
+              sentHeaders: {},
+              status: cached.status || 200,
+              statusText: 'OK (Cached from Player)',
+              contentType: cached.format === 'mpd' ? 'application/dash+xml' : 'application/vnd.apple.mpegurl',
+              finalUrl: cached.finalUrl || url,
+              redirected: false,
+              preview: text,
+              cacheUsed: true,
+              ok: true
+            });
+            updateDebugActiveStrategy('In-Page Player Cache');
+            return {
+              ok: true,
+              status: cached.status || 200,
+              text,
+              url: cached.finalUrl || url,
+              cacheUsed: true
+            };
+          }
+        }
+      } catch (cacheErr) {
+        console.warn('[Fetch Strategy] Cache lookup error:', cacheErr);
+      }
     }
 
-    throw fetchError || new Error(`Network failure requesting ${url}`);
+    // If working strategy has already been established, reuse it immediately (Requirement 2.D)
+    if (workingStrategy) {
+      try {
+        const res = await executeStrategy(workingStrategy, url, { responseType, isPlaylist, headers, signal });
+        if (res && res.ok) return res;
+      } catch (err) {
+        if (err.isChallenge || err.isExpired || err.name === 'AbortError' || isCancelled) throw err;
+        console.warn(`[Fetch Strategy] Primary working strategy ${workingStrategy} failed, trying alternatives:`, err.message);
+      }
+    }
+
+    // Try strategy chain in order: A (same-frame) -> B (content-script) -> C (header-replay)
+    const strategies = ['same-frame', 'content-script', 'header-replay'];
+    let lastError = null;
+    let lastStatus = 0;
+
+    for (const strat of strategies) {
+      if (isCancelled) return null;
+      try {
+        const res = await executeStrategy(strat, url, { responseType, isPlaylist, headers, signal });
+        if (res && res.ok) {
+          if (!workingStrategy) {
+            workingStrategy = strat;
+            console.log(`[Fetch Strategy] Successfully established working strategy: ${strat}`);
+            updateDebugActiveStrategy(strat);
+          }
+          return res;
+        }
+        if (res && res.status) lastStatus = res.status;
+      } catch (err) {
+        lastError = err;
+        if (err.isChallenge || err.isExpired || err.name === 'AbortError' || isCancelled) throw err;
+        console.warn(`[Fetch Strategy] Strategy ${strat} failed:`, err.message);
+      }
+    }
+
+    // Check expired token (Requirement 4)
+    if (checkExpiredUrl(url, lastStatus)) {
+      throw new Error(EXPIRED_MSG);
+    }
+
+    // On final failure, show notice with tried strategies and display Copy Debug Info button (Requirement 3 & 4)
+    if (noticeCopyDebugBtn) noticeCopyDebugBtn.classList.remove('hidden');
+    const triedStr = strategies.join(' -> ');
+    throw new Error(`Failed to load stream after trying all strategies (${triedStr}). HTTP Status: ${lastStatus || 'ERR'}. Click "Copy Debug Info" to inspect diagnostics.`);
   }
 
   // ---------------------------------------------------------------------------
-  // 6. Segment Matrix UI
+  // 7. Segment Matrix UI
   // ---------------------------------------------------------------------------
   function buildSegmentGrid(count) {
     if (!segmentsGrid) return;
@@ -650,7 +1257,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 7. Resolution Picker (Shown BEFORE downloading - Section B)
+  // 8. Pre-Download Resolution Picker (Requirement 4)
   // ---------------------------------------------------------------------------
   async function showResolutionPicker(parsedMaster) {
     masterPlaylistData = parsedMaster;
@@ -659,12 +1266,12 @@
     setStatus('Choose quality', false);
     updatePipelineStep('picker', 'Step 0: Choose Quality');
 
-    // De-duplicate variants and sort by resolution descending (Section B.3)
+    // De-duplicate variants and sort by resolution descending
     const deduplicatedVariants = (typeof HlsParser !== 'undefined' && HlsParser.sortAndDeduplicateVariants)
       ? HlsParser.sortAndDeduplicateVariants(parsedMaster.variants)
       : parsedMaster.variants.slice().sort((a, b) => (b.height || 0) - (a.height || 0));
 
-    // Retrieve saved user quality preference (Section B.7)
+    // Retrieve saved user quality preference
     let savedQualityPref = 'highest';
     try {
       const storage = await chrome.storage.local.get(['stream_quality_pref', 'stream_remember_pref']);
@@ -698,7 +1305,6 @@
         sizeStr = bitrateStr;
       }
 
-      // Check preference match
       if (savedQualityPref !== 'highest') {
         if (resLabel.toLowerCase().includes(savedQualityPref.toLowerCase())) {
           preselectedIndex = index;
@@ -734,11 +1340,10 @@
       variantsList.appendChild(card);
     });
 
-    // Mark initial selected
     const initialSelectedCard = variantsList.children[preselectedIndex];
     if (initialSelectedCard) initialSelectedCard.classList.add('selected');
 
-    // Separate Audio Tracks Selector (#EXT-X-MEDIA:TYPE=AUDIO - Section B.4)
+    // Separate Audio Tracks Selector (#EXT-X-MEDIA:TYPE=AUDIO)
     if (parsedMaster.audioGroups && Object.keys(parsedMaster.audioGroups).length > 0) {
       pickerAudioSelect.innerHTML = '';
       let hasAudioOptions = false;
@@ -781,7 +1386,6 @@
       pickerSubtitleSection.classList.add('hidden');
     }
 
-    // Show picker card and hide caching box
     if (resolutionPickerCard) resolutionPickerCard.classList.remove('hidden');
     if (cachingBox) cachingBox.classList.add('hidden');
   }
@@ -789,7 +1393,6 @@
   async function handlePickerStart() {
     if (!masterPlaylistData) return;
 
-    // Determine chosen variant
     const selectedRadio = document.querySelector('input[name="variant_pick"]:checked');
     if (!selectedRadio) {
       showNotice('Please select a resolution to download.', 'error');
@@ -801,20 +1404,17 @@
     const chosenIndex = chosenCard ? parseInt(chosenCard.dataset.index, 10) : 0;
     selectedVariant = masterPlaylistData.variants[chosenIndex] || { url: chosenVariantUrl };
 
-    // Separate audio rendition
     if (!pickerAudioSection.classList.contains('hidden') && pickerAudioSelect.value) {
       selectedAudioTrack = { url: pickerAudioSelect.value };
     } else {
       selectedAudioTrack = null;
     }
 
-    // Subtitles
     selectedSubtitles = [];
     document.querySelectorAll('#picker-subtitles-list input:checked').forEach(cb => {
       selectedSubtitles.push({ url: cb.value, language: cb.dataset.lang, name: cb.dataset.name });
     });
 
-    // Save preferences
     if (pickerRememberPref && pickerRememberPref.checked) {
       const chosenLabel = selectedVariant.resolutionLabel || `${selectedVariant.height || 'best'}p`;
       chrome.storage.local.set({
@@ -823,11 +1423,9 @@
       });
     }
 
-    // Hide picker card and show caching box
     if (resolutionPickerCard) resolutionPickerCard.classList.add('hidden');
     if (cachingBox) cachingBox.classList.remove('hidden');
 
-    // Fetch and setup chosen variant media playlist
     setStatus('Loading chosen variant...', true);
     updatePipelineStep('loading', 'Loading Chosen Variant');
 
@@ -839,6 +1437,7 @@
 
       setupMediaPlaylist(subParsed);
     } catch (err) {
+      if (err.isChallenge || err.isExpired) return;
       setStatus('Failed to load variant', false);
       updatePipelineStep('error', 'Variant Load Failed');
       showNotice(`Error loading variant playlist: ${err.message}`, 'error', true);
@@ -854,7 +1453,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 8. Staged Pipeline: Codec Detect & Setup Media Playlist
+  // 9. Staged Pipeline: Setup & Media Playlists
   // ---------------------------------------------------------------------------
   function parseM3U8Content(text, baseUrl, httpStatus = 200) {
     if (typeof HlsParser !== 'undefined' && typeof HlsParser.parse === 'function') {
@@ -872,7 +1471,7 @@
       const res = await fetchWithStrategy(url, { isPlaylist: true, responseType: 'text' });
       const parsed = parseM3U8Content(res.text, url, res.status);
 
-      // 1. DRM Check (Section C & E)
+      // 1. DRM Check (Requirement 4)
       if (parsed.isDrmProtected) {
         isDrmProtected = true;
         if (drmBanner) drmBanner.classList.remove('hidden');
@@ -886,17 +1485,20 @@
         return;
       }
 
-      // 2. Master Playlist with variants -> Show Resolution Picker BEFORE downloading (Section B)
+      // 2. Master Playlist with variants -> Show Resolution Picker BEFORE downloading (Requirement 4)
       if (parsed.type === 'master' || parsed.isMaster) {
         await showResolutionPicker(parsed);
       } else {
-        // Single media playlist (no variants): Skip picker directly (Section B.5)
         if (resolutionPickerCard) resolutionPickerCard.classList.add('hidden');
         if (cachingBox) cachingBox.classList.remove('hidden');
         setupMediaPlaylist(parsed);
       }
     } catch (err) {
       console.warn('Playlist load error:', err);
+      if (err.isChallenge || err.isExpired) {
+        // Challenge or expired token banners have already been displayed and retries stopped.
+        return;
+      }
       if (err.message && (err.message.includes('Missing #EXTM3U tag') || err.message.includes('Server returned an HTML page') || err.message.includes('Invalid M3U8'))) {
         setupDirectChunkDownload(url, originalTitle);
         return;
@@ -924,7 +1526,7 @@
 
     buildSegmentGrid(segmentsList.length);
 
-    // Codec Detection (Section C.1)
+    // Codec Detection
     if (selectedVariant && selectedVariant.codecs && typeof CodecDetect !== 'undefined') {
       detectedCodecs = CodecDetect.parseCodecs(selectedVariant.codecs);
     } else {
@@ -938,7 +1540,6 @@
       };
     }
 
-    // Live stream banner
     if (isLiveStream) {
       if (liveBanner) liveBanner.classList.remove('hidden');
       setStatus('Live Stream Ready', false);
@@ -1037,7 +1638,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 9. Disk Streaming & Transmuxing Engine (Section C.4 & C.5)
+  // 10. Disk Streaming & Transmuxing Engine
   // ---------------------------------------------------------------------------
   async function initializeDiskStream(filename, ext) {
     if (!streamDiskToggle || !streamDiskToggle.checked || !window.showSaveFilePicker) {
@@ -1123,7 +1724,6 @@
       const outputFormat = outputFormatSelect.value;
 
       while (true) {
-        // Retrieve segment from IndexedDB SegmentStore or fallback cache (Section C.2)
         let segData = null;
         if (typeof SegmentStore !== 'undefined') {
           segData = await SegmentStore.getSegment(sessionDownloadId, nextWriteIndex);
@@ -1137,7 +1737,6 @@
 
         const segMeta = segmentsList[nextWriteIndex];
 
-        // First segment PMT inspection for codec detection if codecs unknown (Section C.1)
         if (nextWriteIndex === 0 && !isFmp4 && !isDirectStream && typeof CodecDetect !== 'undefined') {
           if (detectedCodecs.videoCodec === 'unknown') {
             const pmtResult = CodecDetect.detectFromTsPmt(segData);
@@ -1148,14 +1747,10 @@
           }
         }
 
-        // Accumulate raw TS chunks for ffmpeg.wasm remux and raw TS fallback
         if (!isDirectStream && !isFmp4) {
           rawTsChunks.push(segData);
         }
 
-        // Routing (Section C.6):
-        // AVC + AAC goes through mux.js TransmuxEngine, then FFmpeg remux
-        // HEVC / AV1 / VP9 skips mux.js and is remuxed directly by FFmpeg from raw TS
         const shouldTransmuxWithMuxJs = (!isDirectStream && outputFormat === 'mp4' && !isFmp4 && transmuxSession && detectedCodecs.isAvcAac);
 
         if (shouldTransmuxWithMuxJs) {
@@ -1165,7 +1760,6 @@
           transmuxSession.push(new Uint8Array(segData));
           transmuxSession.flush();
         } else {
-          // Direct write (raw TS, fMP4, HEVC, or direct chunk stream)
           if (writableStream) {
             await writableStream.write(segData);
           } else {
@@ -1187,7 +1781,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 10. Worker Pool & Download Loop (Section C.3)
+  // 11. Worker Pool & Download Loop (Requirement 2.D)
   // ---------------------------------------------------------------------------
   async function downloadSegmentWithRetry(seg, retries = 3) {
     let lastErr = null;
@@ -1209,6 +1803,7 @@
           }
         }
 
+        // Segments are downloaded using the established working strategy (Requirement 2.D)
         const res = await fetchWithStrategy(fetchUrl, {
           headers: fetchHeaders,
           responseType: 'arraybuffer',
@@ -1221,14 +1816,14 @@
 
         let rawBuf = res.buffer;
 
-        // AES-128 Decryption before storage (Section C.2 & segment-store.js)
+        // AES-128 Decryption before storage (SegmentStore IndexedDB)
         if (seg.encryption && seg.encryption.method === 'AES-128' && typeof SegmentStore !== 'undefined') {
           await SegmentStore.decryptAndStore(sessionDownloadId, seg.index, rawBuf, seg.encryption, seg.sequence);
           const decrypted = await SegmentStore.getSegment(sessionDownloadId, seg.index);
           return decrypted || rawBuf;
         }
 
-        // Store into SegmentStore IndexedDB
+        // Store plain segment in IndexedDB
         if (typeof SegmentStore !== 'undefined') {
           await SegmentStore.putSegment(sessionDownloadId, seg.index, rawBuf, {
             duration: seg.duration,
@@ -1241,7 +1836,6 @@
         if (err.name === 'AbortError' || isCancelled) return null;
         lastErr = err;
         retryCount++;
-        // Exponential backoff: 500ms, 1000ms, 2000ms
         await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt)));
       }
     }
@@ -1316,7 +1910,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 11. Start, Pause, Resume, Cancel & Finish Pipeline
+  // 12. Start, Pause, Resume, Cancel & Finish Pipeline
   // ---------------------------------------------------------------------------
   async function startDownload() {
     if (segmentsList.length === 0) return;
@@ -1348,7 +1942,6 @@
       await initializeDiskStream(safeTitle, outputExt);
     }
 
-    // Set up single TransmuxEngine instance (Section C.4)
     if (!isDirectStream && outputExt === 'mp4' && !isFmp4) {
       setupMuxTransmuxer();
     }
@@ -1374,6 +1967,7 @@
     setStatus('Downloading Segments...', true);
     updatePipelineStep('downloading', `Step 1: Downloading Segments (${segmentsList.length})`);
 
+    // Launch worker pool
     for (let i = 0; i < concurrency; i++) {
       workerLoop();
     }
@@ -1494,7 +2088,7 @@
       }
     }
 
-    // 3. Remux MPEG-TS to MP4 with bundled ffmpeg.wasm (Section C.5 & C.6)
+    // 3. Remux MPEG-TS to MP4 with bundled ffmpeg.wasm
     let finalBlob = null;
     let detectedDuration = 0;
 
@@ -1509,15 +2103,12 @@
       try {
         const concatenatedTs = concatBuffers(rawTsChunks);
 
-        // Check if separate audio track was chosen (Section B.4 & Section C.6)
         if (selectedAudioTrack && audioSegmentsList.length > 0 && typeof FfmpegRemuxEngine !== 'undefined') {
           updatePipelineStep('merging', 'Merging Audio and Video Tracks');
           setStatus('Merging audio and video tracks...', true);
-          // Dual track merge
           console.log('[Pipeline Routing] Separate audio track detected. Merging video + audio with FFmpegRemuxEngine.');
         }
 
-        // Remux single track
         if (typeof FfmpegRemuxEngine !== 'undefined') {
           console.log(`[Pipeline Routing] Routing path: ${detectedCodecs.label} -> FfmpegRemuxEngine faststart remux.`);
           const remuxResult = await FfmpegRemuxEngine.remuxSingleTrack(concatenatedTs, {
@@ -1565,7 +2156,6 @@
       finalBlob = new Blob(assembledBlobParts, { type: mimeType });
     }
 
-    // Direct disk streaming final write
     if (writableStream) {
       try {
         const arrayBuf = await finalBlob.arrayBuffer();
@@ -1587,7 +2177,6 @@
       }
     }
 
-    // Trigger browser download
     triggerBlobDownload(finalBlob, finalFilename);
 
     setStatus('Done', false);
@@ -1598,11 +2187,9 @@
     cachingStats.textContent = `Download complete: ${segmentsList.length}/${segmentsList.length} segments, ${formatBytes(finalBlob.size)} (${finalFilename})`;
     showNotice(`🎉 Downloaded successfully: ${finalFilename} (${formatBytes(finalBlob.size)})`, 'success');
 
-    // Post-download Sanity Check (Section C.7)
     const finalMediaDuration = detectedDuration > 0 ? detectedDuration : await getBlobDuration(finalBlob);
     runDurationSanityCheck(finalMediaDuration, playlistTotalDuration);
 
-    // Clean up IndexedDB storage
     if (typeof SegmentStore !== 'undefined') {
       SegmentStore.clearDownload(sessionDownloadId).catch(() => {});
     }
@@ -1631,7 +2218,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 12. Live Stream Recording
+  // 13. Live Stream Recording
   // ---------------------------------------------------------------------------
   async function pollLivePlaylist() {
     if (!isRecordingLive || isPaused || isCancelled) return;
@@ -1685,7 +2272,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 13. Event Listeners & Controls
+  // 14. Event Listeners & Controls
   // ---------------------------------------------------------------------------
   function enableTurbo() {
     concurrency = 16;
@@ -1714,6 +2301,20 @@
 
   if (pickerStartBtn) pickerStartBtn.addEventListener('click', handlePickerStart);
   if (pickerCancelBtn) pickerCancelBtn.addEventListener('click', handlePickerCancel);
+
+  // Debug Panel Toggle & Actions (Requirement 3)
+  if (debugToggleHeader) {
+    debugToggleHeader.addEventListener('click', (e) => {
+      if (e.target && e.target.closest('#copy-debug-btn')) return;
+      if (debugPanelBody) {
+        debugPanelBody.classList.toggle('hidden');
+        if (debugArrow) debugArrow.classList.toggle('rotated', debugPanelBody.classList.contains('hidden'));
+      }
+    });
+  }
+
+  if (copyDebugBtn) copyDebugBtn.addEventListener('click', copyDebugInfo);
+  if (noticeCopyDebugBtn) noticeCopyDebugBtn.addEventListener('click', copyDebugInfo);
 
   if (challengeRetryBtn) {
     challengeRetryBtn.addEventListener('click', async () => {
@@ -1799,7 +2400,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 14. Init
+  // 15. Init
   // ---------------------------------------------------------------------------
   async function init() {
     urlDisplay.value = playlistUrl;
@@ -1817,7 +2418,7 @@
       return;
     }
 
-    // Step 1: Initialize Request Context from background & install scoped DNR session rules
+    // Initialize Request Context with full frame context & DNR replay rules (Requirement 1 & 2.C)
     await initRequestContext(playlistUrl);
 
     const isHls = streamType === 'hls' ||

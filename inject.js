@@ -33,6 +33,25 @@
   /** Already-posted URLs (deduplicate within the page context). */
   const postedUrls = new Set();
 
+  /** Post cached playlist response to content script (Requirement 2). */
+  function postPlaylistCache(url, finalUrl, text, format, status) {
+    if (!url || !text) return;
+    let absoluteUrl = url;
+    try {
+      absoluteUrl = new URL(url, location.href).href;
+    } catch (_) {}
+
+    window.postMessage({
+      type: 'STREAM_PLAYLIST_CACHED',
+      url: absoluteUrl,
+      finalUrl: finalUrl ? new URL(finalUrl, location.href).href : absoluteUrl,
+      text: text,
+      format: format || (text.includes('<MPD') ? 'mpd' : 'm3u8'),
+      frameUrl: location.href,
+      status: status || 200
+    }, '*');
+  }
+
   // -------------------------------------------------------------------
   // 2. Safe string conversion & posting detected URLs
   // -------------------------------------------------------------------
@@ -128,13 +147,25 @@
       try {
         const ct = (this.getResponseHeader('content-type') || '').toLowerCase();
         const cl = parseInt(this.getResponseHeader('content-length') || '0', 10);
+        const target = toCleanString(this._svd_url || this.responseURL);
         if (MEDIA_CONTENT_TYPES.some(t => ct.includes(t))) {
           const isVideo = ct.startsWith('video/') || ct.includes('video/mp4') || ct.includes('video/webm');
           const isAudio = ct.startsWith('audio/') || ct.includes('audio/mp4') || ct.includes('audio/webm');
           const mediaType = isVideo ? 'video' : (isAudio ? 'audio' : undefined);
-          const target = toCleanString(this._svd_url || this.responseURL);
           if (target) {
             postDetected(target, 'xhr-ct', mediaType, cl);
+          }
+        }
+
+        // Cache playlist responses intercepted in player XHR (Requirement 2)
+        const isPlaylist = target && (
+          target.includes('.m3u8') || target.includes('.mpd') ||
+          ct.includes('mpegurl') || ct.includes('dash+xml')
+        );
+        if (isPlaylist && this.status >= 200 && this.status < 300) {
+          const respText = typeof this.responseText === 'string' ? this.responseText : '';
+          if (respText && (respText.includes('#EXTM3U') || respText.includes('<MPD') || isPlaylist)) {
+            postPlaylistCache(target, this.responseURL || target, respText, (respText.includes('<MPD') || target.includes('.mpd')) ? 'mpd' : 'm3u8', this.status);
           }
         }
       } catch { /* cross-origin or network error — ignore */ }
@@ -178,14 +209,31 @@
       try {
         const ct = (response.headers.get('content-type') || '').toLowerCase();
         const cl = parseInt(response.headers.get('content-length') || '0', 10);
+        const target = toCleanString(url || response.url);
         if (MEDIA_CONTENT_TYPES.some(t => ct.includes(t))) {
           const isVideo = ct.startsWith('video/') || ct.includes('video/mp4') || ct.includes('video/webm');
           const isAudio = ct.startsWith('audio/') || ct.includes('audio/mp4') || ct.includes('audio/webm');
           const mediaType = isVideo ? 'video' : (isAudio ? 'audio' : undefined);
-          const target = toCleanString(url || response.url);
           if (target) {
             postDetected(target, 'fetch-ct', mediaType, cl);
           }
+        }
+
+        // Cache playlist responses intercepted in player fetch (Requirement 2)
+        const isPlaylist = target && (
+          target.includes('.m3u8') || target.includes('.mpd') ||
+          ct.includes('mpegurl') || ct.includes('dash+xml')
+        );
+        if (isPlaylist && response.ok) {
+          try {
+            // Clone response so player consumption is not interfered with
+            const cloned = response.clone();
+            cloned.text().then(text => {
+              if (text && (text.includes('#EXTM3U') || text.includes('<MPD') || isPlaylist)) {
+                postPlaylistCache(target, response.url || target, text, (text.includes('<MPD') || target.includes('.mpd')) ? 'mpd' : 'm3u8', response.status);
+              }
+            }).catch(() => {});
+          } catch (_) {}
         }
       } catch { /* ignore */ }
     }).catch(() => { /* network error — ignore */ });

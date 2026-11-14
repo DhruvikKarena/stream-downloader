@@ -71,8 +71,8 @@
       <div id="challenge-banner" class="alert-banner challenge-banner hidden">
         <div class="alert-icon">🛡️</div>
         <div class="alert-content">
-          <strong>Bot Challenge Detected</strong>
-          <p id="challenge-message">This site is blocking automated downloads (bot challenge). Open the video page, let it play for a few seconds, then try again.</p>
+          <strong>Verification Required</strong>
+          <p id="challenge-message">This site needs a verification step. Open the video page, complete it, let the video play for a few seconds, then click 'Retry'.</p>
         </div>
         <button id="challenge-retry-btn" class="btn-retry">Retry</button>
       </div>
@@ -82,7 +82,7 @@
         <div class="alert-icon">⏱️</div>
         <div class="alert-content">
           <strong>Authentication Token Expired</strong>
-          <p id="expired-message">The media stream URL has expired or has an invalid authentication token. Please refresh the video page and click Download again.</p>
+          <p id="expired-message">Reload the page, let it play, then retry.</p>
         </div>
         <button id="expired-retry-btn" class="btn-retry">Retry</button>
       </div>
@@ -315,10 +315,40 @@
         </div>
       </section>
 
+      <!-- Diagnostics / Debug Panel (Requirement 3) -->
+      <section class="card-collapsible" id="debug-panel-card">
+        <div class="card-collapsible-header" id="debug-toggle-header">
+          <div class="details-header-title">
+            <span class="details-icon">🛠️</span>
+            <span>Diagnostics & Request Chain Debug</span>
+            <span id="debug-strategy-badge" class="badge">Auto</span>
+          </div>
+          <div class="debug-header-actions">
+            <button id="copy-debug-btn" class="btn-copy-debug" title="Copy redacted diagnostic report">Copy Debug Info</button>
+            <span id="debug-arrow" class="collapse-arrow">▼</span>
+          </div>
+        </div>
+        <div class="card-collapsible-body" id="debug-panel-body">
+          <div class="debug-summary" id="debug-summary">
+            <div class="debug-summary-item"><strong>Working Strategy:</strong> <span id="debug-active-strategy">Probing...</span></div>
+            <div class="debug-summary-item"><strong>Frame Resolution:</strong> <span id="debug-frame-context">Resolving...</span></div>
+            <div class="debug-summary-item"><strong>DNR Rule Match:</strong> <span id="debug-dnr-status">Pending</span></div>
+          </div>
+          <div class="debug-logs-container" id="debug-logs-container">
+            <div class="debug-empty-msg">No network attempts logged yet.</div>
+          </div>
+        </div>
+      </section>
+
       <!-- Error / Notice Box with Retry Button -->
       <div id="notice-box" class="notice-box hidden">
-        <span id="notice-text"></span>
-        <button id="retry-btn" class="btn-retry hidden">Retry</button>
+        <div class="notice-main-line">
+          <span id="notice-text"></span>
+          <div class="notice-actions">
+            <button id="notice-copy-debug-btn" class="btn-notice-debug hidden">Copy Debug Info</button>
+            <button id="retry-btn" class="btn-retry hidden">Retry</button>
+          </div>
+        </div>
       </div>
     </main>
 
@@ -329,6 +359,7 @@
   </div>
 
   <!-- Local Bundled Dependencies (No CDN) -->
+  <script src="frame-context.js"></script>
   <script src="hls-parser.js"></script>
   <script src="codec-detect.js"></script>
   <script src="segment-store.js"></script>
