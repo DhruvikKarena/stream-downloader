@@ -96,7 +96,11 @@
     label: 'AVC + AAC (Default)'
   };
 
-  // Disk Streaming (File System Access API)
+  // Disk Streaming & 5-Step Pipeline State Variables
+  let totalSegmentsCount = 0;
+  let mergedTsBuffer = null;
+  let mergedTsBlob = null;
+  let finalMp4Blob = null;
   let isDiskStreamingActive = false;
   let fileHandle = null;
   let writableStream = null;
@@ -379,6 +383,31 @@
       sanityBanner.classList.remove('hidden');
       console.log(`[Sanity Check] Duration check passed: ${actualDuration}s matches ${expectedDuration}s (${diffPercent.toFixed(1)}% diff)`);
     }
+  }
+
+  function runSizeSanityCheck(finalSize, expectedSegmentBytes) {
+    if (!sanityBanner) return true;
+    if (!expectedSegmentBytes || expectedSegmentBytes <= 0) return true;
+
+    const ratio = finalSize / expectedSegmentBytes;
+    const ratioPercent = (ratio * 100).toFixed(1);
+
+    console.log(`[Sanity Check] Final size: ${finalSize} bytes (${formatBytes(finalSize)}), Segment sum: ${expectedSegmentBytes} bytes (${formatBytes(expectedSegmentBytes)}), Ratio: ${ratioPercent}%`);
+
+    if (ratio < 0.5) {
+      sanityBanner.className = 'alert-banner sanity-banner warning';
+      if (sanityIcon) sanityIcon.textContent = '⚠️';
+      if (sanityTitle) sanityTitle.textContent = `Size Warning: Output is only ${ratioPercent}% of segment data!`;
+      if (sanityMessage) {
+        sanityMessage.textContent = `The final file size (${formatBytes(finalSize)}) is under 50% of total downloaded segments (${formatBytes(expectedSegmentBytes)}). Media data may be incomplete or missing media fragments. Use the Raw TS fallback option below to save the full stream.`;
+      }
+      sanityBanner.classList.remove('hidden');
+      if (fallbackBanner) fallbackBanner.classList.remove('hidden');
+      showNotice(`⚠️ Size Warning: Final file size (${formatBytes(finalSize)}) is under 50% of total segment data (${formatBytes(expectedSegmentBytes)}).`, 'error');
+      console.warn(`[Sanity Check] Warning: Output size ${finalSize} is under 50% of segment sum ${expectedSegmentBytes}`);
+      return false;
+    }
+    return true;
   }
 
   function cleanMediaUrl(rawUrl) {
@@ -1520,11 +1549,20 @@
       initSegmentUrl = parsed.initSegment.url;
     }
 
-    segmentsList = parsed.segments.map((s, idx) => ({ ...s, index: idx }));
+    // -------------------------------------------------------------------------
+    // STEP 1: Calculate the total segments & duration
+    // -------------------------------------------------------------------------
+    segmentsList = (parsed.segments || []).map((s, idx) => ({ ...s, index: idx }));
+    totalSegmentsCount = segmentsList.length;
     downloadedBuffers = {};
-    segmentStatus = new Array(segmentsList.length).fill('waiting');
+    segmentStatus = new Array(totalSegmentsCount).fill('waiting');
 
-    buildSegmentGrid(segmentsList.length);
+    console.log(`[Pipeline Step 1] Calculated total segments: ${totalSegmentsCount}, Duration: ${playlistTotalDuration}s (${formatTime(playlistTotalDuration)})`);
+
+    buildSegmentGrid(totalSegmentsCount);
+    updatePipelineStep('ready', `Step 1: ${totalSegmentsCount} Segments Calculated`);
+    setStatus(`Step 1 Ready: ${totalSegmentsCount} segments (${formatTime(playlistTotalDuration)})`, false);
+    cachingStats.textContent = `Segments: 0 / ${totalSegmentsCount} (0.0%), Total Duration: ${formatTime(playlistTotalDuration)}, Ready to download.`;
 
     // Codec Detection
     if (selectedVariant && selectedVariant.codecs && typeof CodecDetect !== 'undefined') {
@@ -1547,7 +1585,7 @@
       return;
     }
 
-    setStatus('Ready to Download', false);
+    setStatus('Starting Download to IndexedDB...', true);
     startDownload();
   }
 
@@ -1677,107 +1715,70 @@
     }
   }
 
-  function setupMuxTransmuxer() {
-    if (typeof TransmuxEngine === 'undefined') {
-      console.warn('TransmuxEngine not loaded.');
-      return;
+  /**
+   * Scan and verify TS sync byte 0x47 at offsets 0, 188, 376.
+   * If not found, scans the first 4 KB and strips leading bytes (fake image headers). (Requirement 1)
+   */
+  function inspectAndStripTsSegment(segBuffer, segmentIndex = 0) {
+    if (!segBuffer || segBuffer.byteLength === 0) return segBuffer;
+    if (typeof TransmuxEngine !== 'undefined' && typeof TransmuxEngine.inspectAndStripTsSegment === 'function') {
+      return TransmuxEngine.inspectAndStripTsSegment(segBuffer, segmentIndex);
+    }
+    const uint8 = segBuffer instanceof Uint8Array ? segBuffer : new Uint8Array(segBuffer);
+
+    // 1. Log first 16 bytes and size of segment 0 (Requirement 1)
+    if (segmentIndex === 0) {
+      const slice16 = Array.from(uint8.subarray(0, Math.min(16, uint8.length)))
+        .map(b => '0x' + b.toString(16).padStart(2, '0')).join(' ');
+      console.log(`[Segment 0] Downloaded/decrypted size: ${segBuffer.byteLength} bytes. First 16 bytes: [ ${slice16} ]`);
     }
 
-    isTransmuxerInitWritten = false;
-    transmuxSession = TransmuxEngine.createTransmuxer({
-      onInit: async (initSegment) => {
-        try {
-          if (!isTransmuxerInitWritten) {
-            if (writableStream) {
-              await writableStream.write(initSegment);
-            } else {
-              assembledBlobParts.push(initSegment);
-            }
-            isTransmuxerInitWritten = true;
-          }
-        } catch (err) {
-          console.error('Error writing transmuxer init segment:', err);
-        }
-      },
-      onData: async (dataSegment) => {
-        try {
-          if (writableStream) {
-            await writableStream.write(dataSegment);
-          } else {
-            assembledBlobParts.push(dataSegment);
-          }
-        } catch (err) {
-          console.error('Error writing transmuxed data segment:', err);
-        }
-      },
-      onError: (err) => {
-        console.warn('[TransmuxEngine] Warning:', err);
-      }
-    });
-  }
+    // Check if TS sync byte 0x47 is present at offsets 0, 188, 376
+    const hasSyncAtZero = uint8.length >= 377 &&
+      uint8[0] === 0x47 &&
+      uint8[188] === 0x47 &&
+      uint8[376] === 0x47;
 
-  async function drainInOrderSegments() {
-    if (isDraining) return;
-    isDraining = true;
-
-    try {
-      const outputFormat = outputFormatSelect.value;
-
-      while (true) {
-        let segData = null;
-        if (typeof SegmentStore !== 'undefined') {
-          segData = await SegmentStore.getSegment(sessionDownloadId, nextWriteIndex);
-        }
-        if (!segData && downloadedBuffers[nextWriteIndex] !== undefined) {
-          segData = downloadedBuffers[nextWriteIndex];
-        }
-
-        if (!segData) break;
-        delete downloadedBuffers[nextWriteIndex];
-
-        const segMeta = segmentsList[nextWriteIndex];
-
-        if (nextWriteIndex === 0 && !isFmp4 && !isDirectStream && typeof CodecDetect !== 'undefined') {
-          if (detectedCodecs.videoCodec === 'unknown') {
-            const pmtResult = CodecDetect.detectFromTsPmt(segData);
-            if (pmtResult) {
-              detectedCodecs = pmtResult;
-              console.log('[Pipeline Routing] Codec detected from MPEG-TS PMT:', detectedCodecs);
-            }
-          }
-        }
-
-        if (!isDirectStream && !isFmp4) {
-          rawTsChunks.push(segData);
-        }
-
-        const shouldTransmuxWithMuxJs = (!isDirectStream && outputFormat === 'mp4' && !isFmp4 && transmuxSession && detectedCodecs.isAvcAac);
-
-        if (shouldTransmuxWithMuxJs) {
-          if (segMeta && segMeta.discontinuity) {
-            transmuxSession.setBaseMediaDecodeTime(cumulativeDuration);
-          }
-          transmuxSession.push(new Uint8Array(segData));
-          transmuxSession.flush();
-        } else {
-          if (writableStream) {
-            await writableStream.write(segData);
-          } else {
-            assembledBlobParts.push(segData);
-          }
-        }
-
-        if (segMeta && typeof segMeta.duration === 'number') {
-          cumulativeDuration += segMeta.duration;
-        }
-
-        nextWriteIndex++;
-      }
-    } catch (e) {
-      console.error('In-order drain error:', e);
-    } finally {
-      isDraining = false;
+    if (hasSyncAtZero) {
+      return segBuffer instanceof ArrayBuffer ? segBuffer : uint8.buffer;
     }
+
+    // If not found, scan the first 4 KB and strip leading bytes (fake image headers)
+    const scanLimit = Math.min(4096, uint8.length - (188 * 2 + 1));
+    let syncOffset = -1;
+
+    for (let offset = 0; offset <= scanLimit; offset++) {
+      if (uint8[offset] === 0x47 &&
+          uint8[offset + 188] === 0x47 &&
+          uint8[offset + 376] === 0x47) {
+        syncOffset = offset;
+        break;
+      }
+    }
+
+    if (syncOffset === -1) {
+      const fallbackLimit = Math.min(4096, uint8.length - 189);
+      for (let offset = 0; offset <= fallbackLimit; offset++) {
+        if (uint8[offset] === 0x47 && uint8[offset + 188] === 0x47) {
+          syncOffset = offset;
+          break;
+        }
+      }
+    }
+
+    if (syncOffset > 0) {
+      const strippedUint8 = uint8.subarray(syncOffset);
+      const out = new Uint8Array(strippedUint8.byteLength);
+      out.set(strippedUint8);
+      const strippedBuf = out.buffer;
+      console.log(`[Segment ${segmentIndex}] TS sync byte 0x47 not at offset 0. Stripped ${syncOffset} leading bytes (fake image headers). Original size: ${segBuffer.byteLength} bytes -> Stripped size: ${strippedBuf.byteLength} bytes.`);
+      return strippedBuf;
+    }
+
+    if (segBuffer instanceof ArrayBuffer) return segBuffer;
+    const exactOut = new Uint8Array(uint8.byteLength);
+    exactOut.set(uint8);
+    return exactOut.buffer;
   }
 
   // ---------------------------------------------------------------------------
@@ -1818,12 +1819,19 @@
 
         // AES-128 Decryption before storage (SegmentStore IndexedDB)
         if (seg.encryption && seg.encryption.method === 'AES-128' && typeof SegmentStore !== 'undefined') {
-          await SegmentStore.decryptAndStore(sessionDownloadId, seg.index, rawBuf, seg.encryption, seg.sequence);
-          const decrypted = await SegmentStore.getSegment(sessionDownloadId, seg.index);
-          return decrypted || rawBuf;
+          if (typeof SegmentStore.decryptSegmentBuffer === 'function') {
+            rawBuf = await SegmentStore.decryptSegmentBuffer(rawBuf, seg.encryption, seg.sequence);
+          } else {
+            await SegmentStore.decryptAndStore(sessionDownloadId, seg.index, rawBuf, seg.encryption, seg.sequence);
+            const decrypted = await SegmentStore.getSegment(sessionDownloadId, seg.index);
+            if (decrypted) rawBuf = decrypted.data ? (decrypted.data.buffer || decrypted.data) : decrypted;
+          }
         }
 
-        // Store plain segment in IndexedDB
+        // 1. Verify TS sync byte 0x47 and strip fake image headers if present (Requirement 1)
+        rawBuf = inspectAndStripTsSegment(rawBuf, seg.index);
+
+        // Store clean stripped segment in IndexedDB
         if (typeof SegmentStore !== 'undefined') {
           await SegmentStore.putSegment(sessionDownloadId, seg.index, rawBuf, {
             duration: seg.duration,
@@ -1842,6 +1850,9 @@
     throw lastErr;
   }
 
+  // ---------------------------------------------------------------------------
+  // 11. Worker Pool & Download Loop (STEP 2: Download segments & store in IndexedDB)
+  // ---------------------------------------------------------------------------
   async function workerLoop() {
     activeWorkers++;
     try {
@@ -1853,16 +1864,14 @@
         updateSegmentBlock(idx, 'active');
 
         try {
+          // Download, decrypt (if AES-128), strip headers, and save to IndexedDB
           const buf = await downloadSegmentWithRetry(seg);
           if (isCancelled) return;
 
           if (buf) {
-            downloadedBuffers[idx] = buf;
             totalBytes += buf.byteLength;
             segmentStatus[idx] = 'done';
             updateSegmentBlock(idx, 'done');
-
-            drainInOrderSegments();
           }
         } catch (err) {
           console.error(`Segment ${idx + 1} failed:`, err);
@@ -1910,7 +1919,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 12. Start, Pause, Resume, Cancel & Finish Pipeline
+  // 12. Start, Pause, Resume, Cancel & 5-Step Pipeline
   // ---------------------------------------------------------------------------
   async function startDownload() {
     if (segmentsList.length === 0) return;
@@ -1922,8 +1931,11 @@
     nextSegmentIndex = 0;
     nextWriteIndex = 0;
     cumulativeDuration = 0;
-    rawTsChunks = [];
     totalBytes = 0;
+    mergedTsBuffer = null;
+    mergedTsBlob = null;
+    finalMp4Blob = null;
+    rawTsChunks = [];
     assembledBlobParts = [];
     abortController = new AbortController();
 
@@ -1931,43 +1943,24 @@
     if (sanityBanner) sanityBanner.classList.add('hidden');
     if (fallbackBanner) fallbackBanner.classList.add('hidden');
 
+    // Clean any prior stored segments for this download session in IndexedDB
+    if (typeof SegmentStore !== 'undefined') {
+      await SegmentStore.clearDownload(sessionDownloadId).catch(() => {});
+    }
+
     await applyRequestHeaders();
     startSpeedMonitor();
 
-    const outputExt = outputFormatSelect.value;
     const safeTitle = cleanFilename(filenameInput.value || originalTitle);
     updateFfmpegCommand(safeTitle);
 
-    if (streamDiskToggle && streamDiskToggle.checked) {
-      await initializeDiskStream(safeTitle, outputExt);
-    }
+    // -------------------------------------------------------------------------
+    // STEP 2: Download segments and store in IndexedDB
+    // -------------------------------------------------------------------------
+    setStatus(`Step 2: Downloading ${totalSegmentsCount} segments to IndexedDB...`, true);
+    updatePipelineStep('downloading', `Step 2: Downloading to IndexedDB (${totalSegmentsCount} Segments)`);
 
-    if (!isDirectStream && outputExt === 'mp4' && !isFmp4) {
-      setupMuxTransmuxer();
-    }
-
-    // fMP4 Streams: Fetch and write init segment first
-    if (isFmp4 && initSegmentUrl) {
-      setStatus('Fetching fMP4 Init Segment...', true);
-      try {
-        const initRes = await fetchWithStrategy(initSegmentUrl, { responseType: 'arraybuffer' });
-        if (initRes.ok) {
-          initSegmentBuffer = initRes.buffer;
-          if (writableStream) {
-            await writableStream.write(initSegmentBuffer);
-          } else {
-            assembledBlobParts.push(initSegmentBuffer);
-          }
-        }
-      } catch (e) {
-        console.warn('Could not load fMP4 init segment:', e);
-      }
-    }
-
-    setStatus('Downloading Segments...', true);
-    updatePipelineStep('downloading', `Step 1: Downloading Segments (${segmentsList.length})`);
-
-    // Launch worker pool
+    // Launch concurrent worker pool
     for (let i = 0; i < concurrency; i++) {
       workerLoop();
     }
@@ -1987,7 +1980,7 @@
 
   function resumeDownload() {
     isPaused = false;
-    setStatus('Downloading Segments...', true);
+    setStatus(`Downloading ${totalSegmentsCount} Segments to IndexedDB...`, true);
     pauseBtn.innerHTML = `
       <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
         <rect x="6" y="4" width="4" height="16"></rect>
@@ -2018,100 +2011,122 @@
     showNotice('Download cancelled. In-flight requests stopped.', 'error');
   }
 
-  function saveRawTsFallback() {
-    if (rawTsChunks.length === 0 && assembledBlobParts.length === 0) {
-      showNotice('No segments downloaded yet to save as raw TS.', 'error');
+  /**
+   * Option to download raw .ts format (at any stage or on-demand).
+   */
+  async function saveRawTsFallback() {
+    const safeTitle = cleanFilename(filenameInput.value || originalTitle);
+    const tsFilename = `${safeTitle}.ts`;
+
+    if (mergedTsBlob) {
+      triggerBlobDownload(mergedTsBlob, tsFilename);
+      showNotice(`Raw .ts saved (${formatBytes(mergedTsBlob.size)}).`, 'success');
       return;
     }
-    const safeTitle = cleanFilename(filenameInput.value || originalTitle);
-    updateFfmpegCommand(safeTitle);
-    const tsBlob = new Blob(rawTsChunks.length > 0 ? rawTsChunks : assembledBlobParts, { type: 'video/mp2t' });
-    triggerBlobDownload(tsBlob, `${safeTitle}.ts`);
-    if (fallbackBanner) fallbackBanner.classList.remove('hidden');
-    showNotice(`Raw .ts saved (${formatBytes(tsBlob.size)}). Run the manual ffmpeg command below to fix duration & moov faststart.`, 'success');
+
+    // If not merged yet, retrieve whatever segments are currently stored in IndexedDB
+    try {
+      setStatus('Exporting available segments from IndexedDB as .ts...', true);
+      if (typeof SegmentStore === 'undefined') {
+        showNotice('SegmentStore is not available.', 'error');
+        return;
+      }
+      const all = await SegmentStore.getAllSegments(sessionDownloadId);
+      if (!all || all.length === 0) {
+        showNotice('No segments downloaded yet to save as raw TS.', 'error');
+        return;
+      }
+      const chunks = all.map(s => (s.data instanceof Uint8Array ? s.data : new Uint8Array(s.data)));
+      const combined = concatBuffers(chunks);
+      const tsBlob = new Blob([combined], { type: 'video/mp2t' });
+      triggerBlobDownload(tsBlob, tsFilename);
+      if (fallbackBanner) fallbackBanner.classList.remove('hidden');
+      showNotice(`Exported ${all.length} segments as raw .ts (${formatBytes(tsBlob.size)}).`, 'success');
+    } catch (e) {
+      showNotice(`Error exporting raw TS: ${e.message}`, 'error');
+    }
   }
 
+  /**
+   * Main Pipeline Execution (Steps 3, 4, 5):
+   * 3. Once every segment is stored in IndexedDB, merge everything in .ts format.
+   * 4. Once .ts format is generated, convert to .mp4 with FFmpeg.wasm.
+   * 5. Download the .mp4 file and also give option to download .ts file.
+   */
   async function finishDownload() {
     isDownloading = false;
     stopSpeedMonitor();
     clearRequestHeaders();
     if (livePollTimer) clearInterval(livePollTimer);
 
-    await drainInOrderSegments();
-
-    progressBarFill.style.width = '100%';
-    progressBarBuffered.style.width = '100%';
-    setStatus('Finalizing File...', true);
-    updatePipelineStep('merging', 'Step 2: Assembling File');
-
-    const outputExt = outputFormatSelect.value;
     const safeTitle = cleanFilename(filenameInput.value || originalTitle);
-    const finalFilename = `${safeTitle}.${outputExt}`;
     updateFfmpegCommand(safeTitle);
+    const mp4Filename = `${safeTitle}.mp4`;
+    const tsFilename = `${safeTitle}.ts`;
 
-    await new Promise(r => setTimeout(r, 300));
-
-    // 1. Raw TS Fallback Mode: User requested .ts format
-    if (outputExt === 'ts') {
-      const tsBlob = new Blob(rawTsChunks.length > 0 ? rawTsChunks : assembledBlobParts, { type: 'video/mp2t' });
-      triggerBlobDownload(tsBlob, finalFilename);
-      setStatus('Raw TS Saved!', false);
-      updatePipelineStep('completed', 'Step 3: Saved Raw TS');
-      if (fallbackBanner) fallbackBanner.classList.remove('hidden');
-      cachingStats.textContent = `✅ All ${segmentsList.length} segments saved as raw TS: ${finalFilename} (${formatBytes(tsBlob.size)})`;
-      showNotice(`Raw .ts saved. Run the ffmpeg command below to create an MP4 with fixed timestamps.`, 'success');
-
-      const dur = await getBlobDuration(tsBlob);
-      runDurationSanityCheck(dur, playlistTotalDuration);
-
-      if (typeof SegmentStore !== 'undefined') SegmentStore.clearDownload(sessionDownloadId).catch(() => {});
+    const totalSegments = segmentsList.length;
+    if (totalSegments === 0) {
+      showNotice('No segments available to assemble.', 'error');
       return;
     }
 
-    // 2. Direct Disk Stream (FSA) for fMP4 or direct chunk streams
-    if (writableStream && (isFmp4 || isDirectStream)) {
-      try {
-        await writableStream.close();
-        writableStream = null;
-        setStatus('Saved to Disk!', false);
-        updatePipelineStep('completed', 'Step 3: Saved to Disk');
-        cachingStats.textContent = `✅ All ${segmentsList.length} segments saved directly to disk: ${finalFilename} (${formatBytes(totalBytes)})`;
-        showNotice(`🎉 Video saved successfully directly to disk: ${finalFilename} (${formatBytes(totalBytes)})`, 'success');
-
-        const dur = playlistTotalDuration;
-        runDurationSanityCheck(dur, playlistTotalDuration);
-
-        if (typeof SegmentStore !== 'undefined') SegmentStore.clearDownload(sessionDownloadId).catch(() => {});
-        return;
-      } catch (err) {
-        console.error('Error closing writable stream:', err);
-      }
-    }
-
-    // 3. Remux MPEG-TS to MP4 with bundled ffmpeg.wasm
-    let finalBlob = null;
-    let detectedDuration = 0;
-
-    const canUseFfmpeg = typeof FfmpegRemuxEngine !== 'undefined' || typeof window.FFmpegRemuxer !== 'undefined';
-
-    if (outputExt === 'mp4' && rawTsChunks.length > 0 && canUseFfmpeg) {
-      setStatus('Finalizing MP4 with ffmpeg.wasm...', true);
-      updatePipelineStep('remuxing', 'Step 2: Remuxing MP4 (Timestamp & Moov Fix)');
+    try {
+      // -----------------------------------------------------------------------
+      // STEP 3: Once every segment is stored in IndexedDB, merge everything in TS format
+      // -----------------------------------------------------------------------
+      setStatus(`Step 3: Merging all ${totalSegments} segments from IndexedDB into .ts format...`, true);
+      updatePipelineStep('merging', `Step 3: Merging in TS format (${totalSegments} segments)`);
       progressBarFill.style.width = '0%';
       progressBarBuffered.style.width = '0%';
 
-      try {
-        const concatenatedTs = concatBuffers(rawTsChunks);
+      const tsParts = [];
+      let totalMergedBytes = 0;
 
-        if (selectedAudioTrack && audioSegmentsList.length > 0 && typeof FfmpegRemuxEngine !== 'undefined') {
-          updatePipelineStep('merging', 'Merging Audio and Video Tracks');
-          setStatus('Merging audio and video tracks...', true);
-          console.log('[Pipeline Routing] Separate audio track detected. Merging video + audio with FFmpegRemuxEngine.');
+      for (let i = 0; i < totalSegments; i++) {
+        if (isCancelled) return;
+        let record = null;
+        if (typeof SegmentStore !== 'undefined') {
+          record = await SegmentStore.getSegment(sessionDownloadId, i);
         }
+        if (!record || !record.data) {
+          throw new Error(`Missing segment ${i + 1}/${totalSegments} in IndexedDB.`);
+        }
+        const u8 = record.data instanceof Uint8Array ? record.data : new Uint8Array(record.data);
+        tsParts.push(u8);
+        totalMergedBytes += u8.byteLength;
 
-        if (typeof FfmpegRemuxEngine !== 'undefined') {
-          console.log(`[Pipeline Routing] Routing path: ${detectedCodecs.label} -> FfmpegRemuxEngine faststart remux.`);
-          const remuxResult = await FfmpegRemuxEngine.remuxSingleTrack(concatenatedTs, {
+        const mergePct = Math.round(((i + 1) / totalSegments) * 100);
+        progressBarFill.style.width = `${mergePct}%`;
+        progressBarBuffered.style.width = `${Math.min(mergePct + 5, 100)}%`;
+        cachingStats.textContent = `Merging segments in TS format: ${i + 1} / ${totalSegments} (${mergePct}%) — ${formatBytes(totalMergedBytes)}`;
+      }
+
+      // Concatenate all segment buffers into a single continuous MPEG-TS
+      mergedTsBuffer = concatBuffers(tsParts);
+      mergedTsBlob = new Blob([mergedTsBuffer], { type: 'video/mp2t' });
+      rawTsChunks = [mergedTsBuffer]; // Keep populated for fallback references
+      console.log(`[Pipeline Step 3] Merged TS created: ${mergedTsBuffer.byteLength} bytes (${formatBytes(mergedTsBuffer.byteLength)}) from ${totalSegments} segments.`);
+
+      // Update manual TS command & display
+      updateFfmpegCommand(safeTitle);
+      if (fallbackBanner) fallbackBanner.classList.remove('hidden');
+
+      // -----------------------------------------------------------------------
+      // STEP 4: Once TS format is generated, convert to MP4
+      // -----------------------------------------------------------------------
+      setStatus('Step 4: Converting TS to MP4 with FFmpeg.wasm...', true);
+      updatePipelineStep('remuxing', 'Step 4: Converting TS to MP4');
+      progressBarFill.style.width = '0%';
+      progressBarBuffered.style.width = '0%';
+
+      let detectedDuration = playlistTotalDuration;
+
+      const remuxEngine = (typeof window !== 'undefined' && window.FFmpegRemuxer) || (typeof FfmpegRemuxEngine !== 'undefined' ? FfmpegRemuxEngine : null);
+
+      if (remuxEngine) {
+        try {
+          const remuxFn = (remuxEngine.remuxTsToMp4 || remuxEngine.remuxSingleTrack).bind(remuxEngine);
+          const remuxResult = await remuxFn(mergedTsBuffer, {
             expectedDuration: playlistTotalDuration,
             onProgress: (p) => {
               const pct = Math.round((p.ratio || 0) * 100);
@@ -2119,79 +2134,99 @@
               progressBarBuffered.style.width = `${Math.min(pct + 5, 100)}%`;
               const timeStr = formatTime(p.time || 0);
               const totalStr = formatTime(playlistTotalDuration || p.duration || 0);
-              cachingStats.textContent = `Remuxing MP4 with ffmpeg.wasm: ${pct}% (${timeStr} / ${totalStr}) [PTS Normalization + Faststart]`;
+              cachingStats.textContent = `Converting TS to MP4 with FFmpeg: ${pct}% (${timeStr} / ${totalStr}) [PTS Normalization + Faststart]`;
             }
           });
 
-          finalBlob = new Blob([remuxResult.mp4Data], { type: 'video/mp4' });
-          detectedDuration = remuxResult.duration || 0;
-        } else if (typeof window.FFmpegRemuxer !== 'undefined') {
-          const remuxResult = await window.FFmpegRemuxer.remuxTsToMp4(concatenatedTs, {
-            expectedDuration: playlistTotalDuration,
-            onProgress: (p) => {
-              const pct = Math.round((p.ratio || 0) * 100);
-              progressBarFill.style.width = `${pct}%`;
-              progressBarBuffered.style.width = `${Math.min(pct + 5, 100)}%`;
-              const timeStr = formatTime(p.time || 0);
-              const totalStr = formatTime(playlistTotalDuration || p.duration || 0);
-              cachingStats.textContent = `Remuxing MP4 with ffmpeg.wasm: ${pct}% (${timeStr} / ${totalStr}) [PTS Normalization + Faststart]`;
-            }
-          });
+          finalMp4Blob = new Blob([remuxResult.mp4Data], { type: 'video/mp4' });
+          if (remuxResult.duration > 0) detectedDuration = remuxResult.duration;
+          console.log(`[Pipeline Step 4] FFmpeg conversion complete: MP4 size: ${finalMp4Blob.size} bytes (${formatBytes(finalMp4Blob.size)}), Duration: ${detectedDuration}s`);
+        } catch (remuxErr) {
+          console.warn('[Pipeline Step 4] FFmpeg remux error, trying TransmuxEngine fallback:', remuxErr);
+          showNotice(`FFmpeg conversion warning: ${remuxErr.message}. Falling back to mux.js transmuxer...`, 'warning');
 
-          finalBlob = new Blob([remuxResult.mp4Data], { type: 'video/mp4' });
-          detectedDuration = remuxResult.duration || 0;
+          if (typeof TransmuxEngine !== 'undefined') {
+            try {
+              const transmuxer = new TransmuxEngine.TransmuxSession({
+                onData: () => {},
+                isFmp4: false
+              });
+              for (const part of tsParts) {
+                transmuxer.push(part);
+                transmuxer.flush();
+              }
+              const assembled = transmuxer.getAssembledBoxes();
+              if (assembled && assembled.length > 0) {
+                finalMp4Blob = new Blob(assembled, { type: 'video/mp4' });
+              }
+            } catch (tErr) {
+              console.error('TransmuxEngine fallback also failed:', tErr);
+            }
+          }
         }
-      } catch (remuxErr) {
-        console.warn('ffmpeg.wasm remux error, falling back to assembled parts:', remuxErr);
-        showNotice(`ffmpeg.wasm remux notice: ${remuxErr.message}. Falling back to assembled chunks.`, 'error');
-        if (fallbackBanner) fallbackBanner.classList.remove('hidden');
-        finalBlob = new Blob(assembledBlobParts, { type: 'video/mp4' });
       }
-    } else {
-      let mimeType = 'video/mp4';
-      if (outputExt === 'webm') mimeType = 'video/webm';
-      else if (outputExt === 'm4a') mimeType = 'audio/mp4';
-      else if (outputExt === 'mp3') mimeType = 'audio/mpeg';
-      else if (outputExt === 'weba') mimeType = 'audio/webm';
-      finalBlob = new Blob(assembledBlobParts, { type: mimeType });
-    }
 
-    if (writableStream) {
-      try {
-        const arrayBuf = await finalBlob.arrayBuffer();
-        await writableStream.write(arrayBuf);
-        await writableStream.close();
-        writableStream = null;
-        setStatus('Saved to Disk!', false);
-        updatePipelineStep('completed', 'Step 3: Saved to Disk');
-        cachingStats.textContent = `✅ Video saved directly to disk: ${finalFilename} (${formatBytes(finalBlob.size)})`;
-        showNotice(`🎉 Video saved successfully directly to disk: ${finalFilename}`, 'success');
+      // -----------------------------------------------------------------------
+      // STEP 5: Download the MP4 file and also give option to download TS file
+      // -----------------------------------------------------------------------
+      progressBarFill.style.width = '100%';
+      progressBarBuffered.style.width = '100%';
+      setStatus('Step 5: Download Ready!', false);
+      updatePipelineStep('completed', 'Step 5: Download Complete');
 
-        const actualDur = detectedDuration > 0 ? detectedDuration : await getBlobDuration(finalBlob);
-        runDurationSanityCheck(actualDur, playlistTotalDuration);
+      // Auto-save MP4 if enabled
+      if (finalMp4Blob) {
+        if (autoSaveToggle && autoSaveToggle.checked) {
+          triggerBlobDownload(finalMp4Blob, mp4Filename);
+          showNotice(`🎉 MP4 downloaded: ${mp4Filename} (${formatBytes(finalMp4Blob.size)})! You can also download the raw .ts file below.`, 'success');
+        } else {
+          showNotice(`🎉 Ready to save: ${mp4Filename} (${formatBytes(finalMp4Blob.size)}). Click "Download MP4" or "Download .TS" below.`, 'success');
+        }
 
-        if (typeof SegmentStore !== 'undefined') SegmentStore.clearDownload(sessionDownloadId).catch(() => {});
-        return;
-      } catch (err) {
-        console.error('Error streaming final blob to disk:', err);
+        // Configure Save MP4 button
+        if (saveBtn) {
+          saveBtn.classList.remove('hidden');
+          saveBtn.disabled = false;
+          saveBtn.style.opacity = '1';
+          if (saveBtnText) saveBtnText.textContent = 'Download MP4';
+          saveBtn.onclick = () => {
+            triggerBlobDownload(finalMp4Blob, mp4Filename);
+            showNotice(`MP4 downloaded: ${mp4Filename} (${formatBytes(finalMp4Blob.size)})`, 'success');
+          };
+        }
+      } else {
+        // If MP4 conversion was not possible, default to downloading the TS file
+        showNotice(`MP4 conversion could not complete. Saving raw TS file directly: ${tsFilename} (${formatBytes(mergedTsBlob.size)})`, 'warning');
+        triggerBlobDownload(mergedTsBlob, tsFilename);
       }
-    }
 
-    triggerBlobDownload(finalBlob, finalFilename);
+      // Always give option to download the TS file
+      if (saveRawTsBtn) {
+        saveRawTsBtn.classList.remove('hidden');
+        saveRawTsBtn.onclick = () => {
+          triggerBlobDownload(mergedTsBlob, tsFilename);
+          showNotice(`Downloaded raw .ts: ${tsFilename} (${formatBytes(mergedTsBlob.size)})`, 'success');
+        };
+      }
 
-    setStatus('Done', false);
-    updatePipelineStep('completed', 'Step 3: Download Complete');
-    progressBarFill.style.width = '100%';
-    progressBarBuffered.style.width = '100%';
+      const downloadTsBannerBtn = document.getElementById('download-ts-banner-btn');
+      if (downloadTsBannerBtn) {
+        downloadTsBannerBtn.onclick = () => {
+          triggerBlobDownload(mergedTsBlob, tsFilename);
+          showNotice(`Downloaded raw .ts: ${tsFilename} (${formatBytes(mergedTsBlob.size)})`, 'success');
+        };
+      }
 
-    cachingStats.textContent = `Download complete: ${segmentsList.length}/${segmentsList.length} segments, ${formatBytes(finalBlob.size)} (${finalFilename})`;
-    showNotice(`🎉 Downloaded successfully: ${finalFilename} (${formatBytes(finalBlob.size)})`, 'success');
+      cachingStats.textContent = `✅ Complete! MP4 (${formatBytes(finalMp4Blob ? finalMp4Blob.size : 0)}) and TS (${formatBytes(mergedTsBuffer.byteLength)}) ready for download.`;
 
-    const finalMediaDuration = detectedDuration > 0 ? detectedDuration : await getBlobDuration(finalBlob);
-    runDurationSanityCheck(finalMediaDuration, playlistTotalDuration);
+      // Sanity Checks: Compare final size with sum of segments & durations
+      runSizeSanityCheck(finalMp4Blob ? finalMp4Blob.size : mergedTsBuffer.byteLength, totalMergedBytes);
+      runDurationSanityCheck(detectedDuration, playlistTotalDuration);
 
-    if (typeof SegmentStore !== 'undefined') {
-      SegmentStore.clearDownload(sessionDownloadId).catch(() => {});
+    } catch (err) {
+      console.error('[Pipeline Error]:', err);
+      showNotice(`Pipeline error: ${err.message}. You can save the raw TS file below.`, 'error', true);
+      if (fallbackBanner) fallbackBanner.classList.remove('hidden');
     }
   }
 
@@ -2298,6 +2333,8 @@
   if (cancelBtn) cancelBtn.addEventListener('click', cancelDownload);
   if (saveBtn) saveBtn.addEventListener('click', finishDownload);
   if (saveRawTsBtn) saveRawTsBtn.addEventListener('click', saveRawTsFallback);
+  const downloadTsBannerBtn = document.getElementById('download-ts-banner-btn');
+  if (downloadTsBannerBtn) downloadTsBannerBtn.addEventListener('click', saveRawTsFallback);
 
   if (pickerStartBtn) pickerStartBtn.addEventListener('click', handlePickerStart);
   if (pickerCancelBtn) pickerCancelBtn.addEventListener('click', handlePickerCancel);

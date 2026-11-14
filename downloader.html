@@ -63,6 +63,7 @@
           <div class="command-container">
             <code id="ffmpeg-command-display" class="command-code">ffmpeg -fflags +genpts -i in.ts -c copy -movflags +faststart out.mp4</code>
             <button id="copy-cmd-btn" class="btn-copy-cmd" title="Copy FFmpeg Command">Copy Command</button>
+            <button id="download-ts-banner-btn" class="btn-copy-cmd" style="background:#2563eb;margin-left:8px;" title="Download .TS File">Download .TS</button>
           </div>
         </div>
       </div>
@@ -366,8 +367,8 @@
   <script src="lib/mux.min.js"></script>
   <script src="transmux.js"></script>
   <script src="lib/ffmpeg-core.js"></script>
-  <script src="ffmpeg-remux.js"></script>
   <script src="lib/ffmpeg-remuxer.js"></script>
+  <script src="ffmpeg-remux.js"></script>
   <!-- Downloader Script -->
   <script src="downloader.js"></script>
 </body>

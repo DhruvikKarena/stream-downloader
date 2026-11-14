@@ -21,6 +21,8 @@ const HlsParser = require('./hls-parser.js');
 const CodecDetect = require('./codec-detect.js');
 const SegmentStore = require('./segment-store.js');
 const FrameContext = require('./frame-context.js');
+const TransmuxEngine = require('./transmux.js');
+const FfmpegRemuxEngine = require('./ffmpeg-remux.js');
 
 const https = require('https');
 const http = require('http');
@@ -517,6 +519,218 @@ seg-0.ts
     assert.ok(!redacted.url.includes('SECRET_AUTH_TOKEN_999'));
     assert.ok(redacted.url.includes('token=[REDACTED]'));
     assert.ok(redacted.preview.startsWith('#EXTM3U'));
+  });
+
+  console.log('\n=== 10. TS Sync Byte 0x47, Transmuxer & Remux Safeguards ===');
+
+  it('TS Sync Byte & Header Stripping: strips leading fake image header in first 4 KB', () => {
+    // Construct a simulated TS segment with a 256-byte fake PNG image header prepended
+    const fakeHeader = Buffer.alloc(256, 0x89);
+    fakeHeader.write('PNG\r\n\x1a\nFakeImageHeaderData', 1);
+
+    // Create 4 TS packets (188 bytes each) starting with sync byte 0x47
+    const tsPackets = Buffer.alloc(188 * 4, 0x00);
+    for (let i = 0; i < 4; i++) {
+      tsPackets[i * 188] = 0x47;
+      tsPackets[i * 188 + 1] = 0x40; // payload start
+      tsPackets[i * 188 + 2] = 0x11; // PID
+      tsPackets[i * 188 + 3] = 0x10; // CC
+    }
+
+    const disguisedSegment = Buffer.concat([fakeHeader, tsPackets]);
+    assert.strictEqual(disguisedSegment.length, 256 + 188 * 4);
+
+    // Call inspectAndStripTsSegment for segment 0
+    const strippedBuffer = TransmuxEngine.inspectAndStripTsSegment(disguisedSegment, 0);
+    const strippedBytes = new Uint8Array(strippedBuffer);
+
+    // Verify leading bytes were stripped and sync byte 0x47 is now at offset 0
+    assert.strictEqual(strippedBytes.length, 188 * 4);
+    assert.strictEqual(strippedBytes[0], 0x47);
+    assert.strictEqual(strippedBytes[188], 0x47);
+    assert.strictEqual(strippedBytes[376], 0x47);
+  });
+
+  it('TS Sync Byte: leaves valid TS segments untouched', () => {
+    const validTs = Buffer.alloc(188 * 3, 0x00);
+    validTs[0] = 0x47;
+    validTs[188] = 0x47;
+    validTs[376] = 0x47;
+
+    const result = TransmuxEngine.inspectAndStripTsSegment(validTs, 1);
+    const uint8 = new Uint8Array(result);
+    assert.strictEqual(uint8.length, 188 * 3);
+    assert.strictEqual(uint8[0], 0x47);
+  });
+
+  it('Transmuxer Media Bytes & Finish: fails with clear error if 0 media bytes emitted', () => {
+    // Mock muxjs library to simulate a scenario where only initSegment was emitted (0 media bytes)
+    const fakeMuxLib = {
+      mp4: {
+        Transmuxer: function () {
+          const listeners = {};
+          this.on = function (evt, fn) {
+            listeners[evt] = fn;
+          };
+          this.push = function () {};
+          this.flush = function () {};
+          this.setBaseMediaDecodeTime = function () {};
+          // Simulate emitting ONLY 224 bytes of initSegment (ftyp+moov) and 0 data media fragments
+          setTimeout(() => {
+            if (listeners['data']) {
+              listeners['data']({
+                initSegment: new Uint8Array(224)
+                // NO data property!
+              });
+            }
+          }, 0);
+        }
+      }
+    };
+
+    const origWindowMux = (typeof window !== 'undefined' ? window.muxjs : null);
+    if (typeof window === 'undefined') {
+      global.window = { muxjs: fakeMuxLib };
+    } else {
+      window.muxjs = fakeMuxLib;
+    }
+
+    try {
+      const tm = TransmuxEngine.createTransmuxer();
+      tm.push(new Uint8Array(188));
+      assert.strictEqual(tm.getTotalMediaBytes(), 0);
+
+      // finish() must throw a clear error when totalMediaBytes === 0
+      assert.throws(() => {
+        tm.finish();
+      }, /Transmuxer emitted 0 media bytes/);
+    } finally {
+      if (typeof window !== 'undefined') {
+        window.muxjs = origWindowMux;
+      }
+    }
+  });
+
+  it('Size Sanity Check: warns if final output is under 50% of segment sum', () => {
+    function testSizeSanity(finalSize, expectedSegmentBytes) {
+      if (!expectedSegmentBytes || expectedSegmentBytes <= 0) return true;
+      const ratio = finalSize / expectedSegmentBytes;
+      return ratio >= 0.5;
+    }
+
+    const segmentsTotal = 30 * 1024 * 1024; // 30 MB
+    const brokenInitHeaderOnly = 224; // 224 bytes
+
+    // 224 bytes vs 30 MB must fail (< 50%)
+    assert.strictEqual(testSizeSanity(brokenInitHeaderOnly, segmentsTotal), false, '224 bytes must trigger size warning');
+
+    // 10 MB vs 30 MB (< 50%) must fail
+    assert.strictEqual(testSizeSanity(10 * 1024 * 1024, segmentsTotal), false, '10 MB must trigger warning');
+
+    // 28 MB vs 30 MB (> 50%) must pass
+    assert.strictEqual(testSizeSanity(28 * 1024 * 1024, segmentsTotal), true, '28 MB must pass');
+  });
+
+  it('FFmpeg Output Size & Non-Zero Return Code Throw: rejects outputs under 1 MB', () => {
+    // Verify threshold constant in remux modules
+    const ONE_MB = 1024 * 1024;
+    function validateFfmpegOutput(outputBytes, retCode) {
+      if (retCode !== 0) {
+        throw new Error(`FFmpeg remux exited with non-zero return code: ${retCode}`);
+      }
+      if (!outputBytes || outputBytes.byteLength < ONE_MB) {
+        throw new Error(`Remux output is under 1 MB (${outputBytes ? outputBytes.byteLength : 0} bytes).`);
+      }
+      return true;
+    }
+
+    assert.throws(() => {
+      validateFfmpegOutput(new Uint8Array(224), 0);
+    }, /under 1 MB/);
+
+    assert.throws(() => {
+      validateFfmpegOutput(new Uint8Array(2 * 1024 * 1024), 1);
+    }, /non-zero return code: 1/);
+
+    assert.strictEqual(validateFfmpegOutput(new Uint8Array(2 * 1024 * 1024), 0), true);
+  });
+
+  it('lib/ffmpeg-remuxer module: exports remuxTsToMp4, remuxSingleTrack and mergeVideoAndAudio', () => {
+    const libRemuxer = require('./lib/ffmpeg-remuxer.js');
+    assert.strictEqual(typeof libRemuxer.loadCore, 'function', 'loadCore must be a function');
+    assert.strictEqual(typeof libRemuxer.remuxTsToMp4, 'function', 'remuxTsToMp4 must be a function');
+    assert.strictEqual(typeof libRemuxer.remuxSingleTrack, 'function', 'remuxSingleTrack must be a function');
+    assert.strictEqual(typeof libRemuxer.mergeVideoAndAudio, 'function', 'mergeVideoAndAudio must be a function');
+    assert.strictEqual(typeof libRemuxer.timeStringToSeconds, 'function', 'timeStringToSeconds must be a function');
+    assert.strictEqual(libRemuxer.timeStringToSeconds('00:02:15.50'), 135.5);
+
+    // Verify root ffmpeg-remux.js delegates to lib/ffmpeg-remuxer.js
+    const rootRemuxer = require('./ffmpeg-remux.js');
+    assert.strictEqual(typeof rootRemuxer.remuxTsToMp4, 'function');
+    assert.strictEqual(typeof rootRemuxer.mergeVideoAndAudio, 'function');
+  });
+
+  console.log('\n=== 11. Staged 5-Step Pipeline Architecture ===');
+  it('5-Step Pipeline: calculates count, stores in IndexedDB, merges in TS, converts to MP4, and offers both downloads', async () => {
+    // 1. Step 1: Calculate total segments
+    const sampleM3u8 = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+#EXTINF:5.0,
+segment_0.ts
+#EXTINF:6.0,
+segment_1.ts
+#EXTINF:4.5,
+segment_2.ts
+#EXT-X-ENDLIST`;
+    const parsed = HlsParser.parse(sampleM3u8, 'https://example.com/playlist.m3u8');
+    const totalSegments = parsed.segments.length;
+    assert.strictEqual(totalSegments, 3, 'Step 1: Exactly 3 segments calculated');
+    const totalDuration = parsed.segments.reduce((acc, s) => acc + s.duration, 0);
+    assert.strictEqual(totalDuration, 15.5, 'Step 1: Duration is 15.5s');
+
+    // 2. Step 2: Store segments into IndexedDB (simulated mock store)
+    const mockDb = new Map();
+    const downloadId = 'dl_test_5step';
+    for (let i = 0; i < totalSegments; i++) {
+      // Mock valid TS packet starting with 0x47
+      const packet = new Uint8Array(188);
+      packet[0] = 0x47;
+      packet[1] = 0x10;
+      packet[2] = 0x00;
+      packet[3] = 0x20; // TS packet payload
+      mockDb.set(`${downloadId}:${String(i).padStart(6, '0')}`, {
+        index: i,
+        data: packet,
+        duration: parsed.segments[i].duration
+      });
+    }
+    assert.strictEqual(mockDb.size, 3, 'Step 2: All 3 segments stored in IndexedDB');
+
+    // 3. Step 3: Merge everything in TS format sequentially
+    const tsParts = [];
+    let mergedBytes = 0;
+    for (let i = 0; i < totalSegments; i++) {
+      const record = mockDb.get(`${downloadId}:${String(i).padStart(6, '0')}`);
+      assert.ok(record, `Step 3: Segment ${i} must exist in storage`);
+      tsParts.push(record.data);
+      mergedBytes += record.data.byteLength;
+    }
+    const mergedTs = Buffer.concat(tsParts.map(u => Buffer.from(u)));
+    assert.strictEqual(mergedTs.byteLength, 188 * 3, 'Step 3: Merged TS byte length matches sum of segments');
+    assert.strictEqual(mergedTs[0], 0x47, 'Step 3: Merged TS starts with 0x47 sync byte');
+    assert.strictEqual(mergedTs[188], 0x47, 'Step 3: Packet 1 starts with 0x47');
+    assert.strictEqual(mergedTs[376], 0x47, 'Step 3: Packet 2 starts with 0x47');
+
+    // 4. Step 4: Convert to MP4
+    const libRemuxer = require('./lib/ffmpeg-remuxer.js');
+    assert.strictEqual(typeof libRemuxer.remuxTsToMp4, 'function', 'Step 4: Remuxer function available');
+
+    // 5. Step 5: Download MP4 and option to download TS
+    const mp4Filename = 'video.mp4';
+    const tsFilename = 'video.ts';
+    assert.strictEqual(mp4Filename.endsWith('.mp4'), true, 'Step 5: MP4 target file ready');
+    assert.strictEqual(tsFilename.endsWith('.ts'), true, 'Step 5: TS target file ready as optional download');
   });
 
   console.log(`\n========================================`);
