@@ -67,6 +67,76 @@
         </div>
       </div>
 
+      <!-- Bot Challenge Alert Banner -->
+      <div id="challenge-banner" class="alert-banner challenge-banner hidden">
+        <div class="alert-icon">🛡️</div>
+        <div class="alert-content">
+          <strong>Bot Challenge Detected</strong>
+          <p id="challenge-message">This site is blocking automated downloads (bot challenge). Open the video page, let it play for a few seconds, then try again.</p>
+        </div>
+        <button id="challenge-retry-btn" class="btn-retry">Retry</button>
+      </div>
+
+      <!-- Expired Token Alert Banner -->
+      <div id="expired-banner" class="alert-banner expired-banner hidden">
+        <div class="alert-icon">⏱️</div>
+        <div class="alert-content">
+          <strong>Authentication Token Expired</strong>
+          <p id="expired-message">The media stream URL has expired or has an invalid authentication token. Please refresh the video page and click Download again.</p>
+        </div>
+        <button id="expired-retry-btn" class="btn-retry">Retry</button>
+      </div>
+
+      <!-- Resolution Picker Card (Shown BEFORE downloading when master playlist is detected) -->
+      <section id="resolution-picker-card" class="picker-card hidden">
+        <div class="picker-header">
+          <div class="picker-title-group">
+            <span class="picker-icon">🎬</span>
+            <div>
+              <h2 class="picker-title">Select Download Resolution</h2>
+              <p class="picker-subtitle">Choose your preferred stream rendition before downloading starts.</p>
+            </div>
+          </div>
+          <span id="picker-stream-type-badge" class="badge">HLS Master</span>
+        </div>
+
+        <div class="picker-body">
+          <!-- Variants List -->
+          <div class="variants-container" id="variants-list">
+            <!-- Dynamically populated variant rows -->
+          </div>
+
+          <!-- Separate Audio Track Selector -->
+          <div id="picker-audio-section" class="picker-subgroup hidden">
+            <label for="picker-audio-select" class="picker-sublabel">
+              <span>🔊 Audio Rendition</span>
+              <span class="sublabel-hint">(Separate audio track playlist)</span>
+            </label>
+            <select id="picker-audio-select" class="form-select"></select>
+          </div>
+
+          <!-- Subtitle Tracks -->
+          <div id="picker-subtitle-section" class="picker-subgroup hidden">
+            <span class="picker-sublabel">💬 Subtitles / Captions</span>
+            <div id="picker-subtitles-list" class="subtitles-checklist"></div>
+          </div>
+
+          <!-- Preferences -->
+          <div class="picker-preferences">
+            <label class="toggle-control" title="Remember this quality preference for future downloads">
+              <input type="checkbox" id="picker-remember-pref" checked>
+              <span class="toggle-slider"></span>
+              <span class="toggle-label">Remember quality preference</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="picker-footer">
+          <button id="picker-cancel-btn" class="btn-picker-secondary">Cancel</button>
+          <button id="picker-start-btn" class="btn-picker-primary">Start Download</button>
+        </div>
+      </section>
+
       <!-- Live Stream Detection Banner (Hidden by default) -->
       <div id="live-banner" class="alert-banner live-banner hidden">
         <div class="alert-icon">🔴</div>
@@ -260,8 +330,12 @@
 
   <!-- Local Bundled Dependencies (No CDN) -->
   <script src="hls-parser.js"></script>
+  <script src="codec-detect.js"></script>
+  <script src="segment-store.js"></script>
   <script src="lib/mux.min.js"></script>
+  <script src="transmux.js"></script>
   <script src="lib/ffmpeg-core.js"></script>
+  <script src="ffmpeg-remux.js"></script>
   <script src="lib/ffmpeg-remuxer.js"></script>
   <!-- Downloader Script -->
   <script src="downloader.js"></script>

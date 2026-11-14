@@ -124,13 +124,16 @@ chmod +x install_linux.sh
 
 | Permission | Purpose |
 | :--- | :--- |
-| `nativeMessaging` | Allows communication with the local Python helper (`host.py`) to run `yt-dlp` and `ffmpeg`. |
-| `webRequest` | Enables non-blocking observation of network requests to detect `.m3u8`, `.mpd`, and media streams. |
-| `declarativeNetRequest` | Dynamically injects `Referer` and `Origin` headers for segment fetches in the in-browser HLS engine. |
-| `storage` | Persists detected media lists per tab in `chrome.storage.session`. |
-| `tabs` & `activeTab` | Detects page navigation to clear old streams and reads the current page title for file naming. |
-| `downloads` | Saves assembled video and audio files to the browser's download folder when using the in-browser fallback. |
-| `<all_urls>` | Required for sniffing media URLs across any site playing HTML5 video. |
+| `webRequest` | Non-blocking observation of network requests (`onSendHeaders` with `extraHeaders`) to capture `.m3u8` / `.mpd` requests and extract authentic playback headers (`Referer`, `Origin`, `User-Agent`, `Accept-Language`). |
+| `declarativeNetRequest` | Creates dynamic session rules to replay captured request headers (`Referer`, `Origin`, `User-Agent`, `Accept-Language`) scoped specifically to the extension's own requests (`tabIds: [chrome.tabs.TAB_ID_NONE]`). |
+| `declarativeNetRequestWithHostAccess` | Permits modifying request headers on host URLs without requiring static declarative rule files. |
+| `storage` | Persists per-tab media stream lists, real request headers in `chrome.storage.session`, and user quality preferences in `chrome.storage.local`. |
+| `cookies` | Attaches authenticated site session cookies to `fetch(url, { credentials: "include" })` to prevent HTTP 403 Forbidden errors on cookie-gated streams. |
+| `scripting` | Provides the page-context fallback (`chrome.scripting.executeScript` into `world: "MAIN"`) to execute fetches directly inside the host tab when bot protection or CORS blocks extension-level requests. |
+| `tabs` & `activeTab` | Detects tab navigation and closure for automatic state cleanup, and targets the originating tab for page-context fetches. |
+| `downloads` | Saves assembled, remuxed MP4 or TS files directly to the browser's download directory. |
+| `nativeMessaging` | Allows optional communication with the local native helper (`host.py`) for command-line acceleration. |
+| `<all_urls>` | Host permission required to observe network headers, attach session cookies, and download media segments across any video streaming host. |
 
 ---
 

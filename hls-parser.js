@@ -3,7 +3,8 @@
  *
  * Implements RFC 8216 HLS playlist specification.
  * Parses #EXT-X-DISCONTINUITY and #EXTINF, exposing per-segment duration
- * and discontinuity flags.
+ * and discontinuity flags, master variant streams with de-duplication,
+ * separate audio renditions (#EXT-X-MEDIA:TYPE=AUDIO), and subtitles.
  */
 (function (root, factory) {
   if (typeof define === 'function' && define.amd) {
@@ -42,26 +43,45 @@
   }
 
   /**
+   * Human-readable resolution label from width & height.
+   */
+  function getResolutionLabel(width, height) {
+    const h = parseInt(height, 10) || 0;
+    if (h >= 2160) return '4K (2160p)';
+    if (h >= 1440) return '2K (1440p)';
+    if (h >= 1080) return '1080p (Full HD)';
+    if (h >= 720) return '720p (HD)';
+    if (h >= 480) return '480p (SD)';
+    if (h >= 360) return '360p';
+    if (h >= 240) return '240p';
+    if (h > 0) return `${h}p`;
+    return 'Default Quality';
+  }
+
+  /**
    * Parse an #EXT-X-KEY tag line.
    */
   function parseKeyTag(line, baseUrl) {
     const attrs = line.substring(line.indexOf(':') + 1);
-    const method = extractAttr(attrs, 'METHOD');
+    const method = extractAttr(attrs, 'METHOD') || 'NONE';
     const uri = extractAttr(attrs, 'URI');
     const iv = extractAttr(attrs, 'IV');
-    const keyFormat = extractAttr(attrs, 'KEYFORMAT');
-    const keyFormatVersions = extractAttr(attrs, 'KEYFORMATVERSIONS');
+    const keyFormat = extractAttr(attrs, 'KEYFORMAT') || 'identity';
+    const keyFormatVersions = extractAttr(attrs, 'KEYFORMATVERSIONS') || '1';
+
+    const lowerMethod = method.toUpperCase();
+    const lowerFormat = keyFormat.toLowerCase();
 
     return {
-      method: method || 'NONE',
+      method: lowerMethod,
       uri: uri ? resolveUrl(uri, baseUrl) : '',
       iv: iv || '',
-      keyFormat: keyFormat || 'identity',
-      keyFormatVersions: keyFormatVersions || '1',
-      isDrm: method === 'SAMPLE-AES' ||
-             (keyFormat && keyFormat.toLowerCase().includes('widevine')) ||
-             (keyFormat && keyFormat.toLowerCase().includes('fairplay')) ||
-             (keyFormat && keyFormat.toLowerCase().includes('playready'))
+      keyFormat,
+      keyFormatVersions,
+      isDrm: lowerMethod === 'SAMPLE-AES' ||
+             lowerFormat.includes('widevine') ||
+             lowerFormat.includes('fairplay') ||
+             lowerFormat.includes('playready')
     };
   }
 
@@ -81,14 +101,9 @@
 
   /**
    * Main entry point: Parses Master or Media HLS playlist.
-   *
-   * @param {string} text - Raw M3U8 text content.
-   * @param {string} [baseUrl=''] - Base URL for resolving relative URIs.
-   * @param {number} [httpStatus=200] - HTTP status code of the response.
-   * @returns {Object} Parsed playlist structure.
    */
   function parse(text, baseUrl = '', httpStatus = 200) {
-    const clean = (text || '').trim();
+    const clean = (text || '').replace(/^\uFEFF/, '').trim();
     const m3uIndex = clean.indexOf('#EXTM3U');
     if (m3uIndex === -1) {
       const snippet = clean.slice(0, 200).replace(/\s+/g, ' ');
@@ -121,24 +136,43 @@
   }
 
   /**
-   * Parse Master Playlist containing variant streams and alternate audio.
+   * Parse Master Playlist containing variant streams, alternate audio, and subtitles.
    */
   function parseMasterPlaylist(lines, baseUrl) {
     const variants = [];
     const audioTracks = [];
+    const subtitles = [];
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
 
+      // Parse Audio Tracks (#EXT-X-MEDIA:TYPE=AUDIO)
       if (line.startsWith('#EXT-X-MEDIA') && line.includes('TYPE=AUDIO')) {
         const attrs = line.substring(line.indexOf(':') + 1);
         const groupId = extractAttr(attrs, 'GROUP-ID');
         const uri = extractAttr(attrs, 'URI');
-        const name = extractAttr(attrs, 'NAME');
-        const language = extractAttr(attrs, 'LANGUAGE');
+        const name = extractAttr(attrs, 'NAME') || 'Audio';
+        const language = extractAttr(attrs, 'LANGUAGE') || '';
+        const isDefault = extractAttr(attrs, 'DEFAULT') === 'YES' || extractAttr(attrs, 'AUTOSELECT') === 'YES';
+        audioTracks.push({
+          groupId,
+          name,
+          language,
+          isDefault,
+          url: uri ? resolveUrl(uri, baseUrl) : ''
+        });
+      }
+
+      // Parse Subtitle Tracks (#EXT-X-MEDIA:TYPE=SUBTITLES)
+      if (line.startsWith('#EXT-X-MEDIA') && line.includes('TYPE=SUBTITLES')) {
+        const attrs = line.substring(line.indexOf(':') + 1);
+        const groupId = extractAttr(attrs, 'GROUP-ID');
+        const uri = extractAttr(attrs, 'URI');
+        const name = extractAttr(attrs, 'NAME') || 'Subtitles';
+        const language = extractAttr(attrs, 'LANGUAGE') || '';
         const isDefault = extractAttr(attrs, 'DEFAULT') === 'YES';
         if (uri) {
-          audioTracks.push({
+          subtitles.push({
             groupId,
             name,
             language,
@@ -148,12 +182,25 @@
         }
       }
 
+      // Parse Variant Streams (#EXT-X-STREAM-INF)
       if (line.startsWith('#EXT-X-STREAM-INF')) {
         const attrs = line.substring(line.indexOf(':') + 1);
         const bandwidth = parseInt(extractAttr(attrs, 'BANDWIDTH'), 10) || 0;
+        const averageBandwidth = parseInt(extractAttr(attrs, 'AVERAGE-BANDWIDTH'), 10) || bandwidth;
         const resolution = extractAttr(attrs, 'RESOLUTION');
+        const frameRateStr = extractAttr(attrs, 'FRAME-RATE');
+        const frameRate = frameRateStr ? parseFloat(frameRateStr) : 0;
         const codecs = extractAttr(attrs, 'CODECS');
         const audioGroup = extractAttr(attrs, 'AUDIO');
+        const subtitlesGroup = extractAttr(attrs, 'SUBTITLES');
+
+        let width = 0;
+        let height = 0;
+        if (resolution && resolution.includes('x')) {
+          const dims = resolution.split('x');
+          width = parseInt(dims[0], 10) || 0;
+          height = parseInt(dims[1], 10) || 0;
+        }
 
         let variantUrl = '';
         for (let j = i + 1; j < lines.length; j++) {
@@ -162,35 +209,96 @@
             break;
           }
         }
+
         if (variantUrl) {
           variants.push({
             bandwidth,
-            resolution,
-            codecs,
-            audioGroup,
+            averageBandwidth,
+            bandwidthMbps: ((bandwidth / 1000000) || 0).toFixed(2),
+            resolution: resolution || (height > 0 ? `${width}x${height}` : ''),
+            width,
+            height,
+            frameRate,
+            resolutionLabel: getResolutionLabel(width, height),
+            codecs: codecs || '',
+            audioGroup: audioGroup || '',
+            subtitlesGroup: subtitlesGroup || '',
             url: variantUrl
           });
         }
       }
     }
 
-    // Associate audio tracks with matching variant streams
+    // Group audio tracks by group ID
+    const audioGroups = {};
+    for (const a of audioTracks) {
+      const g = a.groupId || 'default';
+      if (!audioGroups[g]) audioGroups[g] = [];
+      audioGroups[g].push(a);
+      a.default = !!a.isDefault;
+    }
+
+    // Associate audio and subtitle tracks with variants
     for (const v of variants) {
       if (v.audioGroup) {
-        const match = audioTracks.find(a => a.groupId === v.audioGroup);
-        if (match) v.audioUrl = match.url;
+        const matches = audioTracks.filter(a => a.groupId === v.audioGroup);
+        v.audioTracks = matches;
+        const def = matches.find(a => a.isDefault && a.url) || matches.find(a => a.url);
+        if (def) v.audioUrl = def.url;
       } else if (audioTracks.length > 0) {
-        v.audioUrl = audioTracks[0].url;
+        v.audioTracks = audioTracks;
+        const def = audioTracks.find(a => a.isDefault && a.url) || audioTracks.find(a => a.url);
+        if (def) v.audioUrl = def.url;
+      }
+
+      if (v.subtitlesGroup) {
+        v.subtitles = subtitles.filter(s => s.groupId === v.subtitlesGroup);
+      } else {
+        v.subtitles = subtitles;
       }
     }
+
+    // Sort and deduplicate variants
+    const deduplicatedVariants = sortAndDeduplicateVariants(variants);
 
     return {
       type: 'master',
       isMaster: true,
-      variants,
+      variants: deduplicatedVariants,
+      allVariants: variants,
       audioTracks,
+      audioGroups,
+      subtitles,
       isDrmProtected: false
     };
+  }
+
+  /**
+   * Sort by resolution descending, de-duplicate identical resolutions
+   * (keep highest bandwidth variant for each resolution label).
+   */
+  function sortAndDeduplicateVariants(variants) {
+    if (!Array.isArray(variants)) return [];
+
+    // Sort descending by height, then by bandwidth
+    const sorted = [...variants].sort((a, b) => {
+      if (b.height !== a.height) return b.height - a.height;
+      return b.bandwidth - a.bandwidth;
+    });
+
+    // De-duplicate identical resolutions, keeping highest bandwidth
+    const seenHeights = new Map();
+    const result = [];
+
+    for (const v of sorted) {
+      const key = v.height > 0 ? `${v.height}` : (v.resolution || v.url);
+      if (!seenHeights.has(key)) {
+        seenHeights.set(key, true);
+        result.push(v);
+      }
+    }
+
+    return result;
   }
 
   /**
@@ -230,11 +338,9 @@
           isDrmProtected = true;
         }
       } else if (line.startsWith('#EXT-X-DISCONTINUITY')) {
-        // Flag next segment as having a discontinuity
         pendingDiscontinuity = true;
         discontinuityCount++;
       } else if (line.startsWith('#EXTINF')) {
-        // #EXTINF:<duration>,[<title>]
         const val = line.substring(line.indexOf(':') + 1);
         const parts = val.split(',');
         currentDuration = parseFloat(parts[0]) || 0;
@@ -242,7 +348,6 @@
       } else if (line.startsWith('#EXT-X-ENDLIST')) {
         hasEndList = true;
       } else if (!line.startsWith('#')) {
-        // Line is a segment URL
         const segUrl = resolveUrl(line, baseUrl);
         const segIndex = segments.length;
 
@@ -284,6 +389,8 @@
     parse,
     parseMediaPlaylist,
     parseMasterPlaylist,
+    sortAndDeduplicateVariants,
+    getResolutionLabel,
     parseKeyTag,
     extractAttr,
     resolveUrl,

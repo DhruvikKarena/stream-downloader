@@ -57,6 +57,9 @@ const mediaByTab = new Map();
 /** Map<string, DownloadState>  —  downloadId → progress object */
 const activeDownloads = new Map();
 
+/** Map<string, Object>  —  streamUrl → captured request context (Referer, Origin, User-Agent, Accept-Language, pageUrl) */
+const requestContextByUrl = new Map();
+
 /**
  * @typedef {Object} MediaItem
  * @property {string}  url       - The detected media URL.
@@ -530,25 +533,47 @@ chrome.webRequest.onSendHeaders.addListener(
 
     if (!mediaType) return;
 
-    // Extract Referer, Origin, and User-Agent
+    // Extract Referer, Origin, User-Agent, and Accept-Language (Section A.1)
     let referer = '';
     let origin = '';
     let userAgent = '';
+    let acceptLanguage = '';
     if (requestHeaders) {
       for (const h of requestHeaders) {
         const name = (h.name || '').toLowerCase();
         if (name === 'referer') referer = h.value || '';
         else if (name === 'origin') origin = h.value || '';
         else if (name === 'user-agent') userAgent = h.value || '';
+        else if (name === 'accept-language') acceptLanguage = h.value || '';
       }
     }
 
     chrome.tabs.get(tabId, (tab) => {
       const pageUrl = (tab && tab.url) ? tab.url : (referer || '');
+      const reqContext = {
+        url,
+        referer,
+        origin,
+        userAgent,
+        acceptLanguage,
+        pageUrl,
+        tabId,
+        format,
+        timestamp: Date.now()
+      };
+
+      // Persist in memory & chrome.storage.session
+      requestContextByUrl.set(url, reqContext);
+      try {
+        const cleanKey = 'stream_ctx_' + btoa(unescape(encodeURIComponent(url))).replace(/[+/=]/g, '_');
+        chrome.storage.session.set({ [cleanKey]: reqContext }).catch(() => {});
+      } catch (_) {}
+
       addMediaItem(tabId, url, mediaType, 'onSendHeaders', 0, {
         referer,
         origin,
         userAgent,
+        acceptLanguage,
         pageUrl,
         format
       });
@@ -1294,16 +1319,71 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // asynchronous response
   }
 
+  if (action === 'getRequestContext') {
+    (async () => {
+      const targetUrl = message.url || '';
+      let ctx = requestContextByUrl.get(targetUrl);
+      if (!ctx && targetUrl) {
+        try {
+          const cleanKey = 'stream_ctx_' + btoa(unescape(encodeURIComponent(targetUrl))).replace(/[+/=]/g, '_');
+          const data = await chrome.storage.session.get(cleanKey);
+          ctx = data[cleanKey];
+        } catch (_) {}
+      }
+
+      // Fallback search across tab media items if exact URL wasn't in memory
+      if (!ctx) {
+        for (const items of mediaByTab.values()) {
+          const match = items.find(i => i.url === targetUrl || (i.meta && i.meta.pageUrl));
+          if (match && match.meta) {
+            ctx = {
+              url: targetUrl,
+              referer: match.meta.referer || '',
+              origin: match.meta.origin || '',
+              userAgent: match.meta.userAgent || '',
+              acceptLanguage: match.meta.acceptLanguage || '',
+              pageUrl: match.meta.pageUrl || '',
+              tabId: match.tabId
+            };
+            break;
+          }
+        }
+      }
+
+      sendResponse({ success: true, context: ctx || null });
+    })();
+    return true; // async
+  }
+
   if (action === 'setDownloadHeaders') {
     const ruleId = parseInt(message.ruleId, 10) || 8888;
     const referer = message.referer || '';
     const origin = message.origin || '';
+    const userAgent = message.userAgent || '';
+    const acceptLanguage = message.acceptLanguage || '';
+    const streamUrl = message.url || '';
+
+    // Scope urlFilter to the stream host (Section A.2)
+    let urlFilter = '*';
+    if (streamUrl) {
+      try {
+        const u = new URL(streamUrl);
+        urlFilter = `||${u.host}`;
+      } catch {}
+    }
+
     const requestHeaders = [];
     if (referer) {
       requestHeaders.push({ header: 'Referer', operation: 'set', value: referer });
     }
     if (origin) {
       requestHeaders.push({ header: 'Origin', operation: 'set', value: origin });
+    }
+    if (userAgent) {
+      requestHeaders.push({ header: 'User-Agent', operation: 'set', value: userAgent });
+    }
+    if (acceptLanguage) {
+      requestHeaders.push({ header: 'Accept-Language', operation: 'set', value: acceptLanguage });
     }
 
     if (chrome.declarativeNetRequest && requestHeaders.length > 0) {
@@ -1317,11 +1397,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             requestHeaders
           },
           condition: {
-            urlFilter: '*',
+            // Scoped strictly to the extension's own requests (TAB_ID_NONE)
+            tabIds: [chrome.tabs.TAB_ID_NONE],
+            urlFilter,
             resourceTypes: ['xmlhttprequest', 'other']
           }
         }]
-      }).then(() => sendResponse({ success: true }))
+      }).then(() => sendResponse({ success: true, ruleId }))
         .catch(err => {
           console.warn('updateSessionRules error:', err);
           sendResponse({ success: false, error: err.message });
@@ -1343,6 +1425,81 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     sendResponse({ success: true });
     return false;
+  }
+
+  if (action === 'fetchFromPageContext') {
+    const targetTabId = parseInt(message.tabId, 10);
+    const targetUrl = message.url;
+    const responseType = message.responseType || 'text'; // 'text' or 'bytes'
+
+    (async () => {
+      try {
+        if (!chrome.scripting || !chrome.scripting.executeScript) {
+          throw new Error('chrome.scripting API is not available');
+        }
+        if (!targetTabId || targetTabId < 0) {
+          throw new Error('No valid tabId specified for page-context fetch');
+        }
+
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: targetTabId },
+          world: 'MAIN',
+          func: async (fetchUrl, type) => {
+            try {
+              const res = await fetch(fetchUrl, { credentials: 'include' });
+              const headers = {};
+              res.headers.forEach((v, k) => { headers[k.toLowerCase()] = v; });
+
+              if (type === 'bytes' || type === 'arrayBuffer') {
+                const buf = await res.arrayBuffer();
+                const bytes = new Uint8Array(buf);
+                let binary = '';
+                const len = bytes.byteLength;
+                for (let i = 0; i < len; i += 8192) {
+                  binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + 8192, len)));
+                }
+                return {
+                  ok: res.ok,
+                  status: res.status,
+                  statusText: res.statusText,
+                  url: res.url,
+                  redirected: res.redirected,
+                  headers,
+                  base64: btoa(binary)
+                };
+              } else {
+                const text = await res.text();
+                return {
+                  ok: res.ok,
+                  status: res.status,
+                  statusText: res.statusText,
+                  url: res.url,
+                  redirected: res.redirected,
+                  headers,
+                  text
+                };
+              }
+            } catch (err) {
+              return {
+                ok: false,
+                status: 0,
+                error: err.message
+              };
+            }
+          },
+          args: [targetUrl, responseType]
+        });
+
+        if (!results || !results[0] || !results[0].result) {
+          throw new Error('Page-context fetch returned no result');
+        }
+
+        sendResponse({ success: true, result: results[0].result });
+      } catch (err) {
+        sendResponse({ success: false, error: err.message });
+      }
+    })();
+    return true; // async
   }
 
   if (action === 'checkNativeHelper') {

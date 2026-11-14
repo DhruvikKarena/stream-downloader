@@ -5,11 +5,14 @@
   "description": "Detect and download streaming videos (HLS/M3U8, DASH/MPD, MP4) with multi-threaded downloading",
   "permissions": [
     "webRequest",
-    "storage",
-    "activeTab",
-    "tabs",
-    "downloads",
     "declarativeNetRequest",
+    "declarativeNetRequestWithHostAccess",
+    "storage",
+    "cookies",
+    "scripting",
+    "tabs",
+    "activeTab",
+    "downloads",
     "nativeMessaging"
   ],
   "host_permissions": [
@@ -45,6 +48,10 @@
       "resources": [
         "inject.js",
         "hls-parser.js",
+        "codec-detect.js",
+        "segment-store.js",
+        "transmux.js",
+        "ffmpeg-remux.js",
         "lib/mux.min.js",
         "lib/ffmpeg-core.js",
         "lib/ffmpeg-core.wasm",

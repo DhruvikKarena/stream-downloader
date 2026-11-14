@@ -1,22 +1,23 @@
 /* ===================================================================
    Stream Downloader — Multi-Threaded HLS Engine (downloader.js)
    - Runs in extension page context (Blob, URL.createObjectURL, File System Access API)
-   - Master and media playlist parsing (#EXT-X-STREAM-INF, #EXT-X-ENDLIST, #EXT-X-MAP, #EXT-X-KEY)
-   - AES-128 decryption via Web Crypto (AES-CBC) with playlist IV or big-endian sequence IV
-   - Concurrent worker pool (6 parallel default, configurable) with 3 retries & backoff
-   - In-order assembly & streaming to disk (showSaveFilePicker) to prevent memory overload
-   - Transmuxes MPEG-TS to MP4 using bundled /lib/mux.min.js without re-encoding
-   - fMP4 streams: writes init segment first, then media segments
-   - Live stream detection & "Record until stopped" mode
-   - DRM detection (SAMPLE-AES, Widevine, FairPlay, PlayReady) with warning banner
-   - Request headers (Referer, Origin) managed via declarativeNetRequest session rules
+   - Staged Pipeline Architecture:
+       1. Request Context & Header Replay (declarativeNetRequest scoped to TAB_ID_NONE)
+       2. Multi-tier Fetch Strategy Chain (Direct + Credentials -> Page-Context Fallback -> Challenge & Expiry Detection)
+       3. Pre-Download Resolution Picker (De-duplicated variants, audio renditions, subtitles, saved preferences)
+       4. Codec Detection (CODECS attribute parsing & MPEG-TS PMT stream ID inspection)
+       5. Segment Storage & AES-128 Decryption (IndexedDB keyed ${downloadId}:${index}, Web Crypto AES-CBC)
+       6. Transmuxing & In-Order Assembly (Single mux.js transmuxer, setBaseMediaDecodeTime on discontinuity)
+       7. FFmpeg.wasm Remuxing (PTS normalization, -movflags +faststart, moov duration repair, dual-track merge)
+       8. Duration Verification Sanity Check (Sum of #EXTINF vs final duration, 5% threshold warning)
+       9. Raw TS Fallback & Copyable Manual FFmpeg Command
    =================================================================== */
 
 (() => {
   'use strict';
 
   // ---------------------------------------------------------------------------
-  // 1. URL Parameters & State
+  // 1. Session State & URL Parameters
   // ---------------------------------------------------------------------------
   const params = new URLSearchParams(window.location.search);
   let playlistUrl = params.get('url') || '';
@@ -25,9 +26,14 @@
   let refererUrl = params.get('referer') || '';
   let streamType = (params.get('type') || 'hls').toLowerCase();
   let requestedFormat = (params.get('format') || 'mp4').toLowerCase();
+  let currentTabId = parseInt(params.get('tabId') || '0', 10);
 
-  // Dynamic rule ID for declarativeNetRequest session rules
-  const DNR_RULE_ID = 8888;
+  // Unique session identifier for IndexedDB & DNR rule scoping
+  const sessionDownloadId = 'dl_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+  const DNR_RULE_ID = Math.floor(Math.random() * 800000) + 100000;
+
+  // Request context captured from background.js
+  let currentRequestContext = null;
 
   // Concurrency & Workers
   let concurrency = 6;
@@ -36,11 +42,19 @@
 
   // Playlist & Segment State
   let segmentsList = [];
-  let downloadedBuffers = {}; // index -> ArrayBuffer
+  let audioSegmentsList = [];
+  let downloadedBuffers = {}; // In-memory buffer cache for drain fallback
   let segmentStatus = [];     // 'waiting' | 'active' | 'done' | 'error'
+  let audioSegmentStatus = [];
   let nextSegmentIndex = 0;
   let nextWriteIndex = 0;
   let retryCount = 0;
+
+  // Master Playlist & Selection State
+  let masterPlaylistData = null;
+  let selectedVariant = null;
+  let selectedAudioTrack = null;
+  let selectedSubtitles = [];
 
   // Stream Info
   let isMasterPlaylist = false;
@@ -54,19 +68,29 @@
   let initSegmentBuffer = null;
   let mediaSequenceBase = 0;
   let targetDurationSec = 6;
+  let cumulativeDuration = 0;
+  let playlistTotalDuration = 0;
+
+  // Detected Codecs & Pipeline Routing
+  let detectedCodecs = {
+    videoCodec: 'unknown',
+    audioCodec: 'unknown',
+    videoCodecString: '',
+    audioCodecString: '',
+    isAvcAac: true,
+    label: 'AVC + AAC (Default)'
+  };
 
   // Disk Streaming (File System Access API)
   let isDiskStreamingActive = false;
   let fileHandle = null;
   let writableStream = null;
   let assembledBlobParts = [];
-
-  // Transmuxer (mux.js) & Timestamps
-  let transmuxer = null;
-  let isTransmuxerInitWritten = false;
   let rawTsChunks = [];
-  let cumulativeDuration = 0;
-  let playlistTotalDuration = 0;
+
+  // Transmuxer (mux.js) Session
+  let transmuxSession = null;
+  let isTransmuxerInitWritten = false;
 
   // Download & UI Flags
   let isDownloading = false;
@@ -76,19 +100,16 @@
 
   // Speed & Progress Monitoring
   let totalBytes = 0;
-  let expectedTotalBytes = 0;
   let startTime = 0;
   let speedInterval = null;
   let lastBytes = 0;
   let lastSpeedTime = 0;
   let currentSpeed = 0;
 
-  // AES-128 Crypto Cache
-  const cryptoKeyCache = new Map();
-
   // ---------------------------------------------------------------------------
   // 2. DOM Elements
   // ---------------------------------------------------------------------------
+  const cachingBox = document.getElementById('caching-box');
   const cachingStatusLabel = document.getElementById('caching-status-label');
   const cachingFilename = document.getElementById('caching-filename');
   const pipelineStepBadge = document.getElementById('pipeline-step-badge');
@@ -116,6 +137,7 @@
   const threadButtons = document.getElementById('thread-buttons');
   const segmentsGrid = document.getElementById('segments-grid');
 
+  // Banners & Notifications
   const drmBanner = document.getElementById('drm-banner');
   const liveBanner = document.getElementById('live-banner');
   const liveRecordBtn = document.getElementById('live-record-btn');
@@ -123,6 +145,26 @@
   const noticeBox = document.getElementById('notice-box');
   const noticeText = document.getElementById('notice-text');
   const retryBtn = document.getElementById('retry-btn');
+
+  // Challenge & Expired Banners
+  const challengeBanner = document.getElementById('challenge-banner');
+  const challengeMessage = document.getElementById('challenge-message');
+  const challengeRetryBtn = document.getElementById('challenge-retry-btn');
+  const expiredBanner = document.getElementById('expired-banner');
+  const expiredMessage = document.getElementById('expired-message');
+  const expiredRetryBtn = document.getElementById('expired-retry-btn');
+
+  // Resolution Picker Elements
+  const resolutionPickerCard = document.getElementById('resolution-picker-card');
+  const pickerStreamTypeBadge = document.getElementById('picker-stream-type-badge');
+  const variantsList = document.getElementById('variants-list');
+  const pickerAudioSection = document.getElementById('picker-audio-section');
+  const pickerAudioSelect = document.getElementById('picker-audio-select');
+  const pickerSubtitleSection = document.getElementById('picker-subtitle-section');
+  const pickerSubtitlesList = document.getElementById('picker-subtitles-list');
+  const pickerRememberPref = document.getElementById('picker-remember-pref');
+  const pickerCancelBtn = document.getElementById('picker-cancel-btn');
+  const pickerStartBtn = document.getElementById('picker-start-btn');
 
   // Fallback Banner, Command & Sanity Elements
   const fallbackBanner = document.getElementById('fallback-banner');
@@ -135,7 +177,7 @@
   const saveRawTsBtn = document.getElementById('save-raw-ts-btn');
 
   // ---------------------------------------------------------------------------
-  // 3. UI Helpers
+  // 3. UI Helpers & Status Display
   // ---------------------------------------------------------------------------
   function updatePipelineStep(step, text) {
     if (!pipelineStepBadge) return;
@@ -163,6 +205,15 @@
   function hideNotice() {
     if (noticeBox) noticeBox.classList.add('hidden');
     if (retryBtn) retryBtn.classList.add('hidden');
+  }
+
+  function hideAllAlertBanners() {
+    if (drmBanner) drmBanner.classList.add('hidden');
+    if (challengeBanner) challengeBanner.classList.add('hidden');
+    if (expiredBanner) expiredBanner.classList.add('hidden');
+    if (sanityBanner) sanityBanner.classList.add('hidden');
+    if (fallbackBanner) fallbackBanner.classList.add('hidden');
+    hideNotice();
   }
 
   function formatBytes(bytes) {
@@ -312,27 +363,63 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 4. Request Headers via declarativeNetRequest
+  // 4. Request Context & declarativeNetRequest Session Rules (Section A.1 & A.2)
   // ---------------------------------------------------------------------------
-  function applyRequestHeaders() {
-    if (!refererUrl) return;
+  async function initRequestContext(url) {
     try {
-      const u = new URL(refererUrl);
-      const origin = u.origin;
-      chrome.runtime.sendMessage({
-        action: 'setDownloadHeaders',
-        ruleId: DNR_RULE_ID,
-        referer: refererUrl,
-        origin: origin
+      const res = await new Promise((resolve) => {
+        chrome.runtime.sendMessage({ action: 'getRequestContext', url: url || playlistUrl }, resolve);
       });
-    } catch {}
+      if (res && res.success && res.context) {
+        currentRequestContext = res.context;
+        if (!currentTabId && res.context.tabId) {
+          currentTabId = res.context.tabId;
+        }
+        if (!refererUrl && res.context.referer) {
+          refererUrl = res.context.referer;
+        }
+      }
+    } catch (err) {
+      console.warn('[Request Context] Could not get context from background:', err);
+    }
+
+    await applyRequestHeaders(url);
   }
 
-  function clearRequestHeaders() {
+  async function applyRequestHeaders(url) {
     try {
-      chrome.runtime.sendMessage({
-        action: 'clearDownloadHeaders',
-        ruleId: DNR_RULE_ID
+      const targetUrl = url || playlistUrl;
+      const referer = (currentRequestContext && currentRequestContext.referer) || refererUrl || '';
+      let origin = (currentRequestContext && currentRequestContext.origin) || '';
+      if (!origin && referer) {
+        try { origin = new URL(referer).origin; } catch {}
+      }
+      const userAgent = (currentRequestContext && currentRequestContext.userAgent) || '';
+      const acceptLanguage = (currentRequestContext && currentRequestContext.acceptLanguage) || '';
+
+      await new Promise((resolve) => {
+        chrome.runtime.sendMessage({
+          action: 'setDownloadHeaders',
+          ruleId: DNR_RULE_ID,
+          url: targetUrl,
+          referer,
+          origin,
+          userAgent,
+          acceptLanguage
+        }, resolve);
+      });
+    } catch (err) {
+      console.warn('[DNR] Error setting download headers:', err);
+    }
+  }
+
+  async function clearRequestHeaders() {
+    try {
+      await new Promise((resolve) => {
+        chrome.runtime.sendMessage({
+          action: 'clearDownloadHeaders',
+          ruleId: DNR_RULE_ID
+        }, resolve);
       });
     } catch {}
   }
@@ -345,9 +432,204 @@
   });
 
   // ---------------------------------------------------------------------------
-  // 5. Segment Matrix UI
+  // 5. Fetch Strategy Chain (Section A.1 - A.8)
+  // ---------------------------------------------------------------------------
+  function isChallengeResponse(text) {
+    if (!text) return false;
+    const lower = text.toLowerCase();
+    return (
+      lower.includes('just a moment...') ||
+      lower.includes('turnstile') ||
+      lower.includes('challenge-platform') ||
+      lower.includes('attention required! | cloudflare') ||
+      lower.includes('cf-mitigated') ||
+      (lower.includes('verify you are human') && lower.includes('captcha'))
+    );
+  }
+
+  function checkExpiredUrl(url, status) {
+    try {
+      const u = new URL(url);
+      const hasTokenOrExpire =
+        u.searchParams.has('token') ||
+        u.searchParams.has('expires') ||
+        u.searchParams.has('exp') ||
+        u.searchParams.has('expire') ||
+        u.searchParams.has('auth');
+      if (hasTokenOrExpire && (status === 401 || status === 403 || status === 410)) {
+        triggerExpiredDetected();
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  function triggerChallengeDetected(customMsg) {
+    if (challengeBanner) {
+      if (customMsg && challengeMessage) challengeMessage.textContent = customMsg;
+      challengeBanner.classList.remove('hidden');
+    }
+    setStatus('Bot Challenge Detected', false);
+    updatePipelineStep('error', 'Bot Challenge Block');
+    showNotice('This site is blocking automated downloads (bot challenge). Open the video page, let it play for a few seconds, then try again.', 'error', true);
+  }
+
+  function triggerExpiredDetected(customMsg) {
+    if (expiredBanner) {
+      if (customMsg && expiredMessage) expiredMessage.textContent = customMsg;
+      expiredBanner.classList.remove('hidden');
+    }
+    setStatus('Token Expired', false);
+    updatePipelineStep('error', 'Token Expired');
+    showNotice('The media stream URL has expired or has an invalid authentication token. Please refresh the video page and click Download again.', 'error', true);
+  }
+
+  /**
+   * Fetch with staged strategy chain:
+   * 1. Direct fetch with credentials: "include" and DNR session headers
+   * 2. Fallback to chrome.scripting page-context fetch (world: "MAIN") on 403 or HTML block
+   * 3. Response validation: strip BOM, check #EXTM3U, detect bot challenges, check token expiry
+   */
+  async function fetchWithStrategy(url, options = {}) {
+    const {
+      responseType = 'text', // 'text' | 'arraybuffer'
+      isPlaylist = false,
+      headers = {},
+      signal = abortController.signal,
+      allowPageFallback = true,
+      allowTokenRetry = true
+    } = options;
+
+    let directRes = null;
+    let fetchError = null;
+
+    try {
+      directRes = await fetch(url, {
+        method: 'GET',
+        headers,
+        signal,
+        credentials: 'include'
+      });
+    } catch (err) {
+      fetchError = err;
+      if (err.name === 'AbortError' || isCancelled) throw err;
+    }
+
+    let shouldTryPageFallback = false;
+    if (!directRes || !directRes.ok) {
+      const status = directRes ? directRes.status : 0;
+      if (status === 403 || status === 401 || status === 429 || status === 0 || !directRes) {
+        shouldTryPageFallback = true;
+      }
+    }
+
+    let directText = null;
+    if (directRes && directRes.ok) {
+      const cfMitigated = directRes.headers.get('cf-mitigated');
+      if (cfMitigated === 'challenge') {
+        triggerChallengeDetected();
+        throw new Error('Bot challenge detected (cf-mitigated: challenge)');
+      }
+
+      if (responseType === 'text' || isPlaylist) {
+        directText = await directRes.text();
+        if (directText.charCodeAt(0) === 0xFEFF) directText = directText.slice(1);
+        directText = directText.trim();
+
+        if (isChallengeResponse(directText)) {
+          triggerChallengeDetected();
+          throw new Error('This site is blocking automated downloads (bot challenge). Open the video page, let it play for a few seconds, then try again.');
+        }
+
+        if (isPlaylist && !directText.startsWith('#EXTM3U')) {
+          shouldTryPageFallback = true;
+        } else {
+          return { ok: true, status: directRes.status, text: directText, url: directRes.url };
+        }
+      } else {
+        const directBytes = await directRes.arrayBuffer();
+        return { ok: true, status: directRes.status, buffer: directBytes, url: directRes.url };
+      }
+    }
+
+    // Step 4: Page-Context Fallback (Section A.4)
+    if (shouldTryPageFallback && allowPageFallback && currentTabId > 0) {
+      console.log(`[Fetch Strategy] Direct fetch status ${directRes ? directRes.status : 'ERR'}. Attempting page-context fallback via tab ${currentTabId}...`);
+      try {
+        const pageResult = await new Promise((resolve) => {
+          chrome.runtime.sendMessage({
+            action: 'fetchFromPageContext',
+            tabId: currentTabId,
+            url,
+            responseType: (responseType === 'arraybuffer' ? 'bytes' : 'text')
+          }, resolve);
+        });
+
+        if (pageResult && pageResult.success && pageResult.result) {
+          const pr = pageResult.result;
+          if (pr.headers && pr.headers['cf-mitigated'] === 'challenge') {
+            triggerChallengeDetected();
+            throw new Error('Bot challenge detected (cf-mitigated: challenge)');
+          }
+
+          if (responseType === 'text' || isPlaylist) {
+            let text = pr.text || '';
+            if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+            text = text.trim();
+
+            if (isChallengeResponse(text)) {
+              triggerChallengeDetected();
+              throw new Error('This site is blocking automated downloads (bot challenge). Open the video page, let it play for a few seconds, then try again.');
+            }
+
+            if (isPlaylist && !text.startsWith('#EXTM3U')) {
+              checkExpiredUrl(url, pr.status);
+              const preview = text.slice(0, 200).replace(/\s+/g, ' ');
+              throw new Error(`Server returned HTTP ${pr.status}: "${preview}" (Page-context fetch returned invalid #EXTM3U)`);
+            }
+
+            return { ok: pr.ok, status: pr.status, text, url: pr.url || url };
+          } else {
+            const base64 = pr.base64 || '';
+            const binStr = atob(base64);
+            const len = binStr.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+              bytes[i] = binStr.charCodeAt(i);
+            }
+            return { ok: pr.ok, status: pr.status, buffer: bytes.buffer, url: pr.url || url };
+          }
+        }
+      } catch (pageErr) {
+        console.warn('[Fetch Strategy] Page fallback exception:', pageErr);
+      }
+    }
+
+    const finalStatus = directRes ? directRes.status : 0;
+    if (checkExpiredUrl(url, finalStatus)) {
+      throw new Error('The media stream URL has expired or has an invalid authentication token. Please refresh the video page and click Download again.');
+    }
+
+    if (allowTokenRetry) {
+      console.log('[Fetch Strategy] Retrying once with fresh request context...');
+      await initRequestContext(url);
+      return await fetchWithStrategy(url, { ...options, allowTokenRetry: false });
+    }
+
+    if (directRes) {
+      const contentType = directRes.headers.get('content-type') || 'unknown';
+      const preview = directText ? directText.slice(0, 200).replace(/\s+/g, ' ') : '';
+      throw new Error(`Failed to load valid playlist. HTTP ${directRes.status} (${directRes.statusText}), Content-Type: ${contentType}, Final URL: ${directRes.url}. Response preview: "${preview}"`);
+    }
+
+    throw fetchError || new Error(`Network failure requesting ${url}`);
+  }
+
+  // ---------------------------------------------------------------------------
+  // 6. Segment Matrix UI
   // ---------------------------------------------------------------------------
   function buildSegmentGrid(count) {
+    if (!segmentsGrid) return;
     segmentsGrid.innerHTML = '';
     const frag = document.createDocumentFragment();
     const maxCells = Math.min(count, 500);
@@ -368,149 +650,394 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 6. M3U8 Playlist Parser
+  // 7. Resolution Picker (Shown BEFORE downloading - Section B)
   // ---------------------------------------------------------------------------
-  function extractAttr(attrStr, name) {
-    const match = attrStr.match(new RegExp(`${name}=(?:"([^"]*)"|([^,\\s]*))`));
-    return match ? (match[1] || match[2] || '') : '';
-  }
+  async function showResolutionPicker(parsedMaster) {
+    masterPlaylistData = parsedMaster;
+    isMasterPlaylist = true;
 
-  async function fetchPlaylistText(url) {
-    let res;
+    setStatus('Choose quality', false);
+    updatePipelineStep('picker', 'Step 0: Choose Quality');
+
+    // De-duplicate variants and sort by resolution descending (Section B.3)
+    const deduplicatedVariants = (typeof HlsParser !== 'undefined' && HlsParser.sortAndDeduplicateVariants)
+      ? HlsParser.sortAndDeduplicateVariants(parsedMaster.variants)
+      : parsedMaster.variants.slice().sort((a, b) => (b.height || 0) - (a.height || 0));
+
+    // Retrieve saved user quality preference (Section B.7)
+    let savedQualityPref = 'highest';
     try {
-      res = await fetch(url, { signal: abortController.signal, credentials: 'include' });
-    } catch (err) {
-      throw new Error(`Network error when fetching playlist: ${err.message}`);
+      const storage = await chrome.storage.local.get(['stream_quality_pref', 'stream_remember_pref']);
+      if (storage.stream_quality_pref) savedQualityPref = storage.stream_quality_pref;
+      if (pickerRememberPref && storage.stream_remember_pref !== undefined) {
+        pickerRememberPref.checked = storage.stream_remember_pref;
+      }
+    } catch (_) {}
+
+    // Populate Variants List
+    variantsList.innerHTML = '';
+    let preselectedIndex = 0;
+
+    deduplicatedVariants.forEach((v, index) => {
+      const card = document.createElement('label');
+      card.className = 'variant-card';
+      card.dataset.index = index;
+
+      const resLabel = v.resolutionLabel || (typeof HlsParser !== 'undefined' ? HlsParser.getResolutionLabel(v.width, v.height) : `${v.height || 'Auto'}p`);
+      const dims = v.width && v.height ? `${v.width}x${v.height}` : 'Adaptive';
+      const fps = v.frameRate ? `${Math.round(v.frameRate)} fps` : '';
+      const bitrateStr = v.bandwidthMbps ? `${v.bandwidthMbps} Mbps` : (v.bandwidth ? `${(v.bandwidth / 1000000).toFixed(2)} Mbps` : '');
+      const codecInfo = (typeof CodecDetect !== 'undefined') ? CodecDetect.parseCodecs(v.codecs) : { label: v.codecs || 'Standard' };
+
+      // Estimated size = (BANDWIDTH / 8) * totalDuration
+      let sizeStr = '';
+      if (parsedMaster.totalDuration > 0 && v.bandwidth > 0) {
+        const estBytes = (v.bandwidth / 8) * parsedMaster.totalDuration;
+        sizeStr = `~${formatBytes(estBytes)}`;
+      } else if (v.bandwidth > 0) {
+        sizeStr = bitrateStr;
+      }
+
+      // Check preference match
+      if (savedQualityPref !== 'highest') {
+        if (resLabel.toLowerCase().includes(savedQualityPref.toLowerCase())) {
+          preselectedIndex = index;
+        }
+      }
+
+      card.innerHTML = `
+        <input type="radio" name="variant_pick" class="variant-radio" value="${v.url}" ${index === preselectedIndex ? 'checked' : ''}>
+        <div class="variant-info">
+          <div class="variant-title-line">
+            <span class="variant-title">${resLabel}</span>
+            <span class="variant-badge-res">${dims}</span>
+            ${index === 0 ? '<span class="variant-badge-best">BEST</span>' : ''}
+          </div>
+          <div class="variant-meta">
+            ${fps ? `<span>🎞️ ${fps}</span>` : ''}
+            <span>⚙️ ${codecInfo.label}</span>
+          </div>
+        </div>
+        <div class="variant-size-col">
+          <span class="variant-size-value">${sizeStr}</span>
+          <span class="variant-bitrate-value">${bitrateStr}</span>
+        </div>
+      `;
+
+      card.addEventListener('click', () => {
+        document.querySelectorAll('.variant-card').forEach(c => c.classList.remove('selected'));
+        card.classList.add('selected');
+        const radio = card.querySelector('input[type="radio"]');
+        if (radio) radio.checked = true;
+      });
+
+      variantsList.appendChild(card);
+    });
+
+    // Mark initial selected
+    const initialSelectedCard = variantsList.children[preselectedIndex];
+    if (initialSelectedCard) initialSelectedCard.classList.add('selected');
+
+    // Separate Audio Tracks Selector (#EXT-X-MEDIA:TYPE=AUDIO - Section B.4)
+    if (parsedMaster.audioGroups && Object.keys(parsedMaster.audioGroups).length > 0) {
+      pickerAudioSelect.innerHTML = '';
+      let hasAudioOptions = false;
+
+      Object.keys(parsedMaster.audioGroups).forEach(groupId => {
+        const tracks = parsedMaster.audioGroups[groupId];
+        tracks.forEach(track => {
+          hasAudioOptions = true;
+          const opt = document.createElement('option');
+          opt.value = track.url;
+          opt.textContent = `${track.name || track.language || 'Audio'} (${track.language || 'Default'}) [Group: ${groupId}]`;
+          if (track.default) opt.selected = true;
+          pickerAudioSelect.appendChild(opt);
+        });
+      });
+
+      if (hasAudioOptions) {
+        pickerAudioSection.classList.remove('hidden');
+      } else {
+        pickerAudioSection.classList.add('hidden');
+      }
+    } else {
+      pickerAudioSection.classList.add('hidden');
     }
-    const text = await res.text();
-    return { text, status: res.status, ok: res.ok };
+
+    // Subtitles Checklist
+    if (parsedMaster.subtitles && parsedMaster.subtitles.length > 0) {
+      pickerSubtitlesList.innerHTML = '';
+      parsedMaster.subtitles.forEach((sub, idx) => {
+        const item = document.createElement('label');
+        item.className = 'subtitle-item';
+        item.innerHTML = `
+          <input type="checkbox" value="${sub.url}" data-lang="${sub.language || ''}" data-name="${sub.name || ''}">
+          <span>${sub.name || sub.language || `Subtitle ${idx + 1}`} (${sub.language || 'und'})</span>
+        `;
+        pickerSubtitlesList.appendChild(item);
+      });
+      pickerSubtitleSection.classList.remove('hidden');
+    } else {
+      pickerSubtitleSection.classList.add('hidden');
+    }
+
+    // Show picker card and hide caching box
+    if (resolutionPickerCard) resolutionPickerCard.classList.remove('hidden');
+    if (cachingBox) cachingBox.classList.add('hidden');
   }
 
+  async function handlePickerStart() {
+    if (!masterPlaylistData) return;
+
+    // Determine chosen variant
+    const selectedRadio = document.querySelector('input[name="variant_pick"]:checked');
+    if (!selectedRadio) {
+      showNotice('Please select a resolution to download.', 'error');
+      return;
+    }
+
+    const chosenVariantUrl = selectedRadio.value;
+    const chosenCard = selectedRadio.closest('.variant-card');
+    const chosenIndex = chosenCard ? parseInt(chosenCard.dataset.index, 10) : 0;
+    selectedVariant = masterPlaylistData.variants[chosenIndex] || { url: chosenVariantUrl };
+
+    // Separate audio rendition
+    if (!pickerAudioSection.classList.contains('hidden') && pickerAudioSelect.value) {
+      selectedAudioTrack = { url: pickerAudioSelect.value };
+    } else {
+      selectedAudioTrack = null;
+    }
+
+    // Subtitles
+    selectedSubtitles = [];
+    document.querySelectorAll('#picker-subtitles-list input:checked').forEach(cb => {
+      selectedSubtitles.push({ url: cb.value, language: cb.dataset.lang, name: cb.dataset.name });
+    });
+
+    // Save preferences
+    if (pickerRememberPref && pickerRememberPref.checked) {
+      const chosenLabel = selectedVariant.resolutionLabel || `${selectedVariant.height || 'best'}p`;
+      chrome.storage.local.set({
+        stream_quality_pref: chosenIndex === 0 ? 'highest' : chosenLabel,
+        stream_remember_pref: true
+      });
+    }
+
+    // Hide picker card and show caching box
+    if (resolutionPickerCard) resolutionPickerCard.classList.add('hidden');
+    if (cachingBox) cachingBox.classList.remove('hidden');
+
+    // Fetch and setup chosen variant media playlist
+    setStatus('Loading chosen variant...', true);
+    updatePipelineStep('loading', 'Loading Chosen Variant');
+
+    try {
+      const res = await fetchWithStrategy(chosenVariantUrl, { isPlaylist: true, responseType: 'text' });
+      const subParsed = (typeof HlsParser !== 'undefined')
+        ? HlsParser.parse(res.text, chosenVariantUrl, res.status)
+        : parseM3U8Content(res.text, chosenVariantUrl, res.status);
+
+      setupMediaPlaylist(subParsed);
+    } catch (err) {
+      setStatus('Failed to load variant', false);
+      updatePipelineStep('error', 'Variant Load Failed');
+      showNotice(`Error loading variant playlist: ${err.message}`, 'error', true);
+    }
+  }
+
+  function handlePickerCancel() {
+    if (resolutionPickerCard) resolutionPickerCard.classList.add('hidden');
+    if (cachingBox) cachingBox.classList.remove('hidden');
+    setStatus('Download Cancelled', false);
+    updatePipelineStep('error', 'Cancelled by User');
+    showNotice('Download selection was cancelled.', 'error');
+  }
+
+  // ---------------------------------------------------------------------------
+  // 8. Staged Pipeline: Codec Detect & Setup Media Playlist
+  // ---------------------------------------------------------------------------
   function parseM3U8Content(text, baseUrl, httpStatus = 200) {
     if (typeof HlsParser !== 'undefined' && typeof HlsParser.parse === 'function') {
       return HlsParser.parse(text, baseUrl, httpStatus);
     }
+    throw new Error('HlsParser module is not loaded.');
+  }
 
-    // Fallback if HlsParser script is not loaded
-    const clean = (text || '').replace(/^\uFEFF/, '').trim();
-    const m3uIndex = clean.indexOf('#EXTM3U');
-    if (m3uIndex === -1) {
-      const snippet = clean.slice(0, 200).replace(/\s+/g, ' ');
-      if (clean.includes('<html') || clean.includes('<!DOCTYPE')) {
-        throw new Error(`Server returned HTTP ${httpStatus}: "${snippet}" (HTML error page, not #EXTM3U)`);
+  async function setupHlsStream(url) {
+    setStatus('Loading playlist...', true);
+    updatePipelineStep('loading', 'Loading Playlist');
+    hideAllAlertBanners();
+
+    try {
+      const res = await fetchWithStrategy(url, { isPlaylist: true, responseType: 'text' });
+      const parsed = parseM3U8Content(res.text, url, res.status);
+
+      // 1. DRM Check (Section C & E)
+      if (parsed.isDrmProtected) {
+        isDrmProtected = true;
+        if (drmBanner) drmBanner.classList.remove('hidden');
+        setStatus('DRM-Protected Stream', false);
+        updatePipelineStep('error', "DRM-protected, can't be downloaded");
+        if (saveBtn) {
+          saveBtn.disabled = true;
+          saveBtn.style.opacity = '0.5';
+        }
+        showNotice("DRM-protected, can't be downloaded. SAMPLE-AES/Widevine/FairPlay encryption detected.", 'error');
+        return;
       }
-      throw new Error(`Server returned HTTP ${httpStatus}: "${snippet}" (Missing #EXTM3U tag)`);
-    }
 
-    const lines = clean.slice(m3uIndex).split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-    const segments = [];
-    let currentDuration = 0;
-    let pendingDiscontinuity = false;
-    let cumulativeDuration = 0;
-    let mediaSequence = 0;
-    let hasEndList = false;
-    let initSegment = null;
-    let targetDuration = 6;
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      if (line.startsWith('#EXT-X-TARGETDURATION')) {
-        targetDuration = parseFloat(line.split(':')[1]) || 6;
-      } else if (line.startsWith('#EXT-X-MEDIA-SEQUENCE')) {
-        mediaSequence = parseInt(line.split(':')[1], 10) || 0;
-      } else if (line.startsWith('#EXT-X-MAP')) {
-        const attrs = line.substring(line.indexOf(':') + 1);
-        const mapUri = extractAttr(attrs, 'URI');
-        if (mapUri) initSegment = { url: resolveUrl(mapUri, baseUrl) };
-      } else if (line.startsWith('#EXT-X-DISCONTINUITY')) {
-        pendingDiscontinuity = true;
-      } else if (line.startsWith('#EXTINF')) {
-        const val = line.substring(line.indexOf(':') + 1);
-        currentDuration = parseFloat(val.split(',')[0]) || 0;
-      } else if (line.startsWith('#EXT-X-ENDLIST')) {
-        hasEndList = true;
-      } else if (!line.startsWith('#')) {
-        segments.push({
-          url: resolveUrl(line, baseUrl),
-          duration: currentDuration,
-          discontinuity: pendingDiscontinuity,
-          cumulativeDuration: cumulativeDuration,
-          index: segments.length,
-          sequence: mediaSequence + segments.length
-        });
-        cumulativeDuration += currentDuration;
-        pendingDiscontinuity = false;
-        currentDuration = 0;
+      // 2. Master Playlist with variants -> Show Resolution Picker BEFORE downloading (Section B)
+      if (parsed.type === 'master' || parsed.isMaster) {
+        await showResolutionPicker(parsed);
+      } else {
+        // Single media playlist (no variants): Skip picker directly (Section B.5)
+        if (resolutionPickerCard) resolutionPickerCard.classList.add('hidden');
+        if (cachingBox) cachingBox.classList.remove('hidden');
+        setupMediaPlaylist(parsed);
       }
+    } catch (err) {
+      console.warn('Playlist load error:', err);
+      if (err.message && (err.message.includes('Missing #EXTM3U tag') || err.message.includes('Server returned an HTML page') || err.message.includes('Invalid M3U8'))) {
+        setupDirectChunkDownload(url, originalTitle);
+        return;
+      }
+      setStatus('Failed to load playlist', false);
+      updatePipelineStep('error', 'Load Failed');
+      showNotice(`Failed to load or parse playlist: ${err.message}`, 'error', true);
     }
-
-    return {
-      type: 'media',
-      segments,
-      totalDuration: cumulativeDuration,
-      mediaSequence,
-      targetDuration,
-      hasEndList,
-      initSegment,
-      isFmp4: !!initSegment || segments.some(s => s.url.includes('.m4s') || s.url.includes('.mp4'))
-    };
   }
 
-  // ---------------------------------------------------------------------------
-  // 7. AES-128 Decryption (Web Crypto AES-CBC)
-  // ---------------------------------------------------------------------------
-  async function getCryptoKey(keyUri) {
-    if (cryptoKeyCache.has(keyUri)) return cryptoKeyCache.get(keyUri);
-    const res = await fetch(keyUri, { signal: abortController.signal, credentials: 'include' });
-    if (!res.ok) throw new Error(`HTTP ${res.status} when fetching AES encryption key`);
-    const keyRaw = await res.arrayBuffer();
-    const cryptoKey = await window.crypto.subtle.importKey(
-      'raw',
-      keyRaw,
-      { name: 'AES-CBC' },
-      false,
-      ['decrypt']
-    );
-    cryptoKeyCache.set(keyUri, cryptoKey);
-    return cryptoKey;
-  }
+  function setupMediaPlaylist(parsed) {
+    isLiveStream = !parsed.hasEndList;
+    isFmp4 = parsed.isFmp4;
+    targetDurationSec = parsed.targetDuration || 6;
+    mediaSequenceBase = parsed.mediaSequence || 0;
+    playlistTotalDuration = parsed.totalDuration || (parsed.segments ? parsed.segments.reduce((acc, s) => acc + (s.duration || 0), 0) : 0);
 
-  function parseHexIv(hexStr) {
-    const clean = hexStr.startsWith('0x') || hexStr.startsWith('0X') ? hexStr.slice(2) : hexStr;
-    const ivBytes = new Uint8Array(16);
-    for (let i = 0; i < 16; i++) {
-      ivBytes[i] = parseInt(clean.substr(i * 2, 2), 16) || 0;
-    }
-    return ivBytes;
-  }
-
-  async function decryptSegmentBuffer(buffer, encryption, sequenceNumber) {
-    if (!encryption || encryption.method !== 'AES-128' || !encryption.uri) {
-      return buffer;
+    if (parsed.initSegment) {
+      initSegmentUrl = parsed.initSegment.url;
     }
 
-    const cryptoKey = await getCryptoKey(encryption.uri);
+    segmentsList = parsed.segments.map((s, idx) => ({ ...s, index: idx }));
+    downloadedBuffers = {};
+    segmentStatus = new Array(segmentsList.length).fill('waiting');
 
-    // IV from tag or default to segment sequence number as a 16-byte big-endian value
-    let ivBytes;
-    if (encryption.iv && encryption.iv.length >= 2) {
-      ivBytes = parseHexIv(encryption.iv);
+    buildSegmentGrid(segmentsList.length);
+
+    // Codec Detection (Section C.1)
+    if (selectedVariant && selectedVariant.codecs && typeof CodecDetect !== 'undefined') {
+      detectedCodecs = CodecDetect.parseCodecs(selectedVariant.codecs);
     } else {
-      ivBytes = new Uint8Array(16);
-      const view = new DataView(ivBytes.buffer);
-      // Sequence number is placed in the last 4 bytes as a big-endian integer
-      view.setUint32(12, sequenceNumber, false);
+      detectedCodecs = {
+        videoCodec: 'unknown',
+        audioCodec: 'unknown',
+        videoCodecString: '',
+        audioCodecString: '',
+        isAvcAac: true,
+        label: 'Auto Detect'
+      };
     }
 
-    return await window.crypto.subtle.decrypt(
-      { name: 'AES-CBC', iv: ivBytes },
-      cryptoKey,
-      buffer
-    );
+    // Live stream banner
+    if (isLiveStream) {
+      if (liveBanner) liveBanner.classList.remove('hidden');
+      setStatus('Live Stream Ready', false);
+      showNotice('Live stream detected (no endlist). Click "Record Live Stream" to begin capturing.', 'success');
+      return;
+    }
+
+    setStatus('Ready to Download', false);
+    startDownload();
+  }
+
+  async function setupDirectChunkDownload(rawUrl, title) {
+    isDirectStream = true;
+    setStatus('Probing Media Stream...', true);
+    hideNotice();
+
+    const cleanUrl = cleanMediaUrl(rawUrl);
+    let totalSize = parseInt(params.get('size'), 10) || 0;
+    let detectedMime = '';
+
+    try {
+      const u = new URL(cleanUrl);
+      const clen = u.searchParams.get('clen');
+      if (clen && parseInt(clen, 10) > 65536) {
+        totalSize = parseInt(clen, 10);
+      }
+      const mime = u.searchParams.get('mime');
+      if (mime) detectedMime = mime;
+    } catch {}
+
+    if (!totalSize) {
+      try {
+        const probeRes = await new Promise(resolve => {
+          chrome.runtime.sendMessage({ action: 'probeMedia', url: cleanUrl }, resolve);
+        });
+        if (probeRes && probeRes.success) {
+          const probedSize = probeRes.totalSize || (probeRes.primary && probeRes.primary.totalSize) || 0;
+          const probedMime = probeRes.mimeType || (probeRes.primary && probeRes.primary.mimeType) || '';
+          if (probedSize > 65536) totalSize = probedSize;
+          if (probedMime) detectedMime = probedMime;
+        }
+      } catch (e) {
+        console.warn('Probe check note:', e);
+      }
+    }
+
+    const isAudio = streamType === 'audio' ||
+                    detectedMime.includes('audio') ||
+                    cleanUrl.includes('mime=audio') ||
+                    cleanUrl.includes('mime%2faudio');
+
+    let defaultExt = isAudio ? 'm4a' : 'mp4';
+    if (detectedMime.includes('webm')) defaultExt = isAudio ? 'weba' : 'webm';
+    else if (detectedMime.includes('mp3') || cleanUrl.endsWith('.mp3')) defaultExt = 'mp3';
+    else if (detectedMime.includes('mp4') || cleanUrl.endsWith('.mp4')) defaultExt = 'mp4';
+
+    outputFormatSelect.value = defaultExt;
+    if (fileExtLabel) fileExtLabel.textContent = `.${defaultExt}`;
+    const safeTitle = cleanFilename(filenameInput.value || title || originalTitle);
+    cachingFilename.textContent = `${safeTitle}.${defaultExt}`;
+
+    segmentsList = [];
+    downloadedBuffers = {};
+
+    if (totalSize > 0) {
+      const CHUNK_SIZE = totalSize <= 4 * 1048576 ? 524288 : 1048576;
+      let offset = 0;
+      while (offset < totalSize) {
+        const end = Math.min(offset + CHUNK_SIZE - 1, totalSize - 1);
+        segmentsList.push({
+          url: cleanUrl,
+          range: `bytes=${offset}-${end}`,
+          start: offset,
+          end: end,
+          size: end - offset + 1,
+          index: segmentsList.length,
+          isDirect: true
+        });
+        offset = end + 1;
+      }
+    } else {
+      segmentsList.push({
+        url: cleanUrl,
+        range: null,
+        index: 0,
+        isDirect: true
+      });
+    }
+
+    segmentStatus = new Array(segmentsList.length).fill('waiting');
+    buildSegmentGrid(segmentsList.length);
+    setStatus('Ready to Download', false);
+    updatePipelineStep('downloading', `Step 1: Downloading Segments (${segmentsList.length})`);
+
+    startDownload();
   }
 
   // ---------------------------------------------------------------------------
-  // 8. Disk Streaming & Transmuxing Engine
+  // 9. Disk Streaming & Transmuxing Engine (Section C.4 & C.5)
   // ---------------------------------------------------------------------------
   async function initializeDiskStream(filename, ext) {
     if (!streamDiskToggle || !streamDiskToggle.checked || !window.showSaveFilePicker) {
@@ -540,7 +1067,7 @@
       showNotice(`Direct disk streaming enabled: Saving directly to "${fileHandle.name}".`, 'success');
       return true;
     } catch (err) {
-      console.warn('showSaveFilePicker was cancelled or unsupported, falling back to in-memory Blob:', err);
+      console.warn('showSaveFilePicker cancelled or unsupported, fallback to memory:', err);
       fileHandle = null;
       writableStream = null;
       isDiskStreamingActive = false;
@@ -550,44 +1077,40 @@
   }
 
   function setupMuxTransmuxer() {
-    if (typeof window.muxjs === 'undefined' || !window.muxjs.mp4) {
-      console.warn('mux.js not loaded, raw TS will be preserved.');
+    if (typeof TransmuxEngine === 'undefined') {
+      console.warn('TransmuxEngine not loaded.');
       return;
     }
 
-    // Single mux.js Transmuxer instance for the whole download
-    // keepOriginalTimestamps is disabled so setBaseMediaDecodeTime functions properly
-    transmuxer = new window.muxjs.mp4.Transmuxer({
-      remux: false,
-      keepOriginalTimestamps: false
-    });
     isTransmuxerInitWritten = false;
-
-    try {
-      transmuxer.setBaseMediaDecodeTime(0);
-    } catch (_) {}
-
-    transmuxer.on('data', async (segment) => {
-      try {
-        // Write the init segment (ftyp + moov) only once for the whole stream
-        if (segment.initSegment && !isTransmuxerInitWritten) {
-          if (writableStream) {
-            await writableStream.write(segment.initSegment);
-          } else {
-            assembledBlobParts.push(segment.initSegment);
+    transmuxSession = TransmuxEngine.createTransmuxer({
+      onInit: async (initSegment) => {
+        try {
+          if (!isTransmuxerInitWritten) {
+            if (writableStream) {
+              await writableStream.write(initSegment);
+            } else {
+              assembledBlobParts.push(initSegment);
+            }
+            isTransmuxerInitWritten = true;
           }
-          isTransmuxerInitWritten = true;
+        } catch (err) {
+          console.error('Error writing transmuxer init segment:', err);
         }
-
-        if (segment.data) {
+      },
+      onData: async (dataSegment) => {
+        try {
           if (writableStream) {
-            await writableStream.write(segment.data);
+            await writableStream.write(dataSegment);
           } else {
-            assembledBlobParts.push(segment.data);
+            assembledBlobParts.push(dataSegment);
           }
+        } catch (err) {
+          console.error('Error writing transmuxed data segment:', err);
         }
-      } catch (err) {
-        console.error('Error writing transmuxed fragment:', err);
+      },
+      onError: (err) => {
+        console.warn('[TransmuxEngine] Warning:', err);
       }
     });
   }
@@ -599,31 +1122,50 @@
     try {
       const outputFormat = outputFormatSelect.value;
 
-      while (downloadedBuffers[nextWriteIndex] !== undefined) {
-        const segData = downloadedBuffers[nextWriteIndex];
+      while (true) {
+        // Retrieve segment from IndexedDB SegmentStore or fallback cache (Section C.2)
+        let segData = null;
+        if (typeof SegmentStore !== 'undefined') {
+          segData = await SegmentStore.getSegment(sessionDownloadId, nextWriteIndex);
+        }
+        if (!segData && downloadedBuffers[nextWriteIndex] !== undefined) {
+          segData = downloadedBuffers[nextWriteIndex];
+        }
+
+        if (!segData) break;
+        delete downloadedBuffers[nextWriteIndex];
+
         const segMeta = segmentsList[nextWriteIndex];
-        delete downloadedBuffers[nextWriteIndex]; // Free memory immediately
+
+        // First segment PMT inspection for codec detection if codecs unknown (Section C.1)
+        if (nextWriteIndex === 0 && !isFmp4 && !isDirectStream && typeof CodecDetect !== 'undefined') {
+          if (detectedCodecs.videoCodec === 'unknown') {
+            const pmtResult = CodecDetect.detectFromTsPmt(segData);
+            if (pmtResult) {
+              detectedCodecs = pmtResult;
+              console.log('[Pipeline Routing] Codec detected from MPEG-TS PMT:', detectedCodecs);
+            }
+          }
+        }
 
         // Accumulate raw TS chunks for ffmpeg.wasm remux and raw TS fallback
         if (!isDirectStream && !isFmp4) {
           rawTsChunks.push(segData);
         }
 
-        if (!isDirectStream && outputFormat === 'mp4' && !isFmp4 && transmuxer) {
-          // On discontinuity, align track fragment decode time to cumulative playlist duration
-          if (segMeta && segMeta.discontinuity) {
-            try {
-              transmuxer.setBaseMediaDecodeTime(Math.round(cumulativeDuration * 90000));
-            } catch (err) {
-              console.warn('[Transmuxer] setBaseMediaDecodeTime warning:', err);
-            }
-          }
+        // Routing (Section C.6):
+        // AVC + AAC goes through mux.js TransmuxEngine, then FFmpeg remux
+        // HEVC / AV1 / VP9 skips mux.js and is remuxed directly by FFmpeg from raw TS
+        const shouldTransmuxWithMuxJs = (!isDirectStream && outputFormat === 'mp4' && !isFmp4 && transmuxSession && detectedCodecs.isAvcAac);
 
-          // Push and flush each segment in order
-          transmuxer.push(new Uint8Array(segData));
-          transmuxer.flush();
+        if (shouldTransmuxWithMuxJs) {
+          if (segMeta && segMeta.discontinuity) {
+            transmuxSession.setBaseMediaDecodeTime(cumulativeDuration);
+          }
+          transmuxSession.push(new Uint8Array(segData));
+          transmuxSession.flush();
         } else {
-          // Direct write (raw TS, fMP4, or direct chunk stream)
+          // Direct write (raw TS, fMP4, HEVC, or direct chunk stream)
           if (writableStream) {
             await writableStream.write(segData);
           } else {
@@ -645,7 +1187,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 9. Worker Pool & Download Loop
+  // 10. Worker Pool & Download Loop (Section C.3)
   // ---------------------------------------------------------------------------
   async function downloadSegmentWithRetry(seg, retries = 3) {
     let lastErr = null;
@@ -667,24 +1209,34 @@
           }
         }
 
-        const res = await fetch(fetchUrl, {
+        const res = await fetchWithStrategy(fetchUrl, {
           headers: fetchHeaders,
-          signal: abortController.signal,
-          credentials: 'include'
+          responseType: 'arraybuffer',
+          isPlaylist: false
         });
 
         if (!res.ok && res.status !== 206) {
           throw new Error(`HTTP ${res.status}`);
         }
 
-        let buf = await res.arrayBuffer();
+        let rawBuf = res.buffer;
 
-        // Decrypt if AES-128
-        if (seg.encryption && seg.encryption.method === 'AES-128') {
-          buf = await decryptSegmentBuffer(buf, seg.encryption, seg.sequence);
+        // AES-128 Decryption before storage (Section C.2 & segment-store.js)
+        if (seg.encryption && seg.encryption.method === 'AES-128' && typeof SegmentStore !== 'undefined') {
+          await SegmentStore.decryptAndStore(sessionDownloadId, seg.index, rawBuf, seg.encryption, seg.sequence);
+          const decrypted = await SegmentStore.getSegment(sessionDownloadId, seg.index);
+          return decrypted || rawBuf;
         }
 
-        return buf;
+        // Store into SegmentStore IndexedDB
+        if (typeof SegmentStore !== 'undefined') {
+          await SegmentStore.putSegment(sessionDownloadId, seg.index, rawBuf, {
+            duration: seg.duration,
+            discontinuity: seg.discontinuity
+          });
+        }
+
+        return rawBuf;
       } catch (err) {
         if (err.name === 'AbortError' || isCancelled) return null;
         lastErr = err;
@@ -716,7 +1268,6 @@
             segmentStatus[idx] = 'done';
             updateSegmentBlock(idx, 'done');
 
-            // In-order assembly & streaming to disk
             drainInOrderSegments();
           }
         } catch (err) {
@@ -742,7 +1293,6 @@
     progressBarFill.style.width = `${percent.toFixed(1)}%`;
     progressBarBuffered.style.width = `${Math.min(percent + 6, 100).toFixed(1)}%`;
 
-    // Speed & ETA
     let timeLeftStr = '--:--:--';
     if (currentSpeed > 0 && total > completed && completed > 0) {
       const avgBytes = totalBytes / completed;
@@ -760,16 +1310,13 @@
     const completed = segmentStatus.filter(s => s === 'done').length;
 
     if (completed === total && total > 0 && activeWorkers === 0) {
-      if (isRecordingLive) {
-        // Continue live recording until user stops
-        return;
-      }
+      if (isRecordingLive) return;
       finishDownload();
     }
   }
 
   // ---------------------------------------------------------------------------
-  // 10. Start, Pause, Resume, Cancel & Finish
+  // 11. Start, Pause, Resume, Cancel & Finish Pipeline
   // ---------------------------------------------------------------------------
   async function startDownload() {
     if (segmentsList.length === 0) return;
@@ -789,19 +1336,19 @@
     hideNotice();
     if (sanityBanner) sanityBanner.classList.add('hidden');
     if (fallbackBanner) fallbackBanner.classList.add('hidden');
-    applyRequestHeaders();
+
+    await applyRequestHeaders();
     startSpeedMonitor();
 
     const outputExt = outputFormatSelect.value;
     const safeTitle = cleanFilename(filenameInput.value || originalTitle);
     updateFfmpegCommand(safeTitle);
 
-    // Prompt user to stream to disk if enabled
     if (streamDiskToggle && streamDiskToggle.checked) {
       await initializeDiskStream(safeTitle, outputExt);
     }
 
-    // Set up transmuxer if converting TS to MP4 (not for direct streams or fMP4)
+    // Set up single TransmuxEngine instance (Section C.4)
     if (!isDirectStream && outputExt === 'mp4' && !isFmp4) {
       setupMuxTransmuxer();
     }
@@ -810,9 +1357,9 @@
     if (isFmp4 && initSegmentUrl) {
       setStatus('Fetching fMP4 Init Segment...', true);
       try {
-        const initRes = await fetch(initSegmentUrl, { signal: abortController.signal, credentials: 'include' });
+        const initRes = await fetchWithStrategy(initSegmentUrl, { responseType: 'arraybuffer' });
         if (initRes.ok) {
-          initSegmentBuffer = await initRes.arrayBuffer();
+          initSegmentBuffer = initRes.buffer;
           if (writableStream) {
             await writableStream.write(initSegmentBuffer);
           } else {
@@ -827,7 +1374,6 @@
     setStatus('Downloading Segments...', true);
     updatePipelineStep('downloading', `Step 1: Downloading Segments (${segmentsList.length})`);
 
-    // Dispatch concurrency workers
     for (let i = 0; i < concurrency; i++) {
       workerLoop();
     }
@@ -869,6 +1415,10 @@
     clearRequestHeaders();
     if (livePollTimer) clearInterval(livePollTimer);
 
+    if (typeof SegmentStore !== 'undefined') {
+      SegmentStore.clearDownload(sessionDownloadId).catch(() => {});
+    }
+
     setStatus('Cancelled', false);
     updatePipelineStep('error', 'Cancelled by User');
     showNotice('Download cancelled. In-flight requests stopped.', 'error');
@@ -893,7 +1443,6 @@
     clearRequestHeaders();
     if (livePollTimer) clearInterval(livePollTimer);
 
-    // Complete in-order draining
     await drainInOrderSegments();
 
     progressBarFill.style.width = '100%';
@@ -918,9 +1467,10 @@
       cachingStats.textContent = `✅ All ${segmentsList.length} segments saved as raw TS: ${finalFilename} (${formatBytes(tsBlob.size)})`;
       showNotice(`Raw .ts saved. Run the ffmpeg command below to create an MP4 with fixed timestamps.`, 'success');
 
-      // Sanity Check
       const dur = await getBlobDuration(tsBlob);
       runDurationSanityCheck(dur, playlistTotalDuration);
+
+      if (typeof SegmentStore !== 'undefined') SegmentStore.clearDownload(sessionDownloadId).catch(() => {});
       return;
     }
 
@@ -936,42 +1486,73 @@
 
         const dur = playlistTotalDuration;
         runDurationSanityCheck(dur, playlistTotalDuration);
+
+        if (typeof SegmentStore !== 'undefined') SegmentStore.clearDownload(sessionDownloadId).catch(() => {});
         return;
       } catch (err) {
         console.error('Error closing writable stream:', err);
       }
     }
 
-    // 3. Remux MPEG-TS to MP4 with bundled ffmpeg.wasm
-    // Command: -fflags +genpts -i in.ts -c copy -movflags +faststart out.mp4
+    // 3. Remux MPEG-TS to MP4 with bundled ffmpeg.wasm (Section C.5 & C.6)
     let finalBlob = null;
     let detectedDuration = 0;
 
-    if (outputExt === 'mp4' && rawTsChunks.length > 0 && typeof window.FFmpegRemuxer !== 'undefined') {
-      setStatus('Remuxing with ffmpeg.wasm...', true);
+    const canUseFfmpeg = typeof FfmpegRemuxEngine !== 'undefined' || typeof window.FFmpegRemuxer !== 'undefined';
+
+    if (outputExt === 'mp4' && rawTsChunks.length > 0 && canUseFfmpeg) {
+      setStatus('Finalizing MP4 with ffmpeg.wasm...', true);
       updatePipelineStep('remuxing', 'Step 2: Remuxing MP4 (Timestamp & Moov Fix)');
       progressBarFill.style.width = '0%';
       progressBarBuffered.style.width = '0%';
 
       try {
         const concatenatedTs = concatBuffers(rawTsChunks);
-        const remuxResult = await window.FFmpegRemuxer.remuxTsToMp4(concatenatedTs, {
-          expectedDuration: playlistTotalDuration,
-          onProgress: (p) => {
-            const pct = Math.round((p.ratio || 0) * 100);
-            progressBarFill.style.width = `${pct}%`;
-            progressBarBuffered.style.width = `${Math.min(pct + 5, 100)}%`;
-            const timeStr = formatTime(p.time || 0);
-            const totalStr = formatTime(playlistTotalDuration || p.duration || 0);
-            cachingStats.textContent = `Remuxing MP4 with ffmpeg.wasm: ${pct}% (${timeStr} / ${totalStr}) [PTS Normalization + Faststart]`;
-          }
-        });
 
-        finalBlob = new Blob([remuxResult.mp4Data], { type: 'video/mp4' });
-        detectedDuration = remuxResult.duration || 0;
+        // Check if separate audio track was chosen (Section B.4 & Section C.6)
+        if (selectedAudioTrack && audioSegmentsList.length > 0 && typeof FfmpegRemuxEngine !== 'undefined') {
+          updatePipelineStep('merging', 'Merging Audio and Video Tracks');
+          setStatus('Merging audio and video tracks...', true);
+          // Dual track merge
+          console.log('[Pipeline Routing] Separate audio track detected. Merging video + audio with FFmpegRemuxEngine.');
+        }
+
+        // Remux single track
+        if (typeof FfmpegRemuxEngine !== 'undefined') {
+          console.log(`[Pipeline Routing] Routing path: ${detectedCodecs.label} -> FfmpegRemuxEngine faststart remux.`);
+          const remuxResult = await FfmpegRemuxEngine.remuxSingleTrack(concatenatedTs, {
+            expectedDuration: playlistTotalDuration,
+            onProgress: (p) => {
+              const pct = Math.round((p.ratio || 0) * 100);
+              progressBarFill.style.width = `${pct}%`;
+              progressBarBuffered.style.width = `${Math.min(pct + 5, 100)}%`;
+              const timeStr = formatTime(p.time || 0);
+              const totalStr = formatTime(playlistTotalDuration || p.duration || 0);
+              cachingStats.textContent = `Remuxing MP4 with ffmpeg.wasm: ${pct}% (${timeStr} / ${totalStr}) [PTS Normalization + Faststart]`;
+            }
+          });
+
+          finalBlob = new Blob([remuxResult.mp4Data], { type: 'video/mp4' });
+          detectedDuration = remuxResult.duration || 0;
+        } else if (typeof window.FFmpegRemuxer !== 'undefined') {
+          const remuxResult = await window.FFmpegRemuxer.remuxTsToMp4(concatenatedTs, {
+            expectedDuration: playlistTotalDuration,
+            onProgress: (p) => {
+              const pct = Math.round((p.ratio || 0) * 100);
+              progressBarFill.style.width = `${pct}%`;
+              progressBarBuffered.style.width = `${Math.min(pct + 5, 100)}%`;
+              const timeStr = formatTime(p.time || 0);
+              const totalStr = formatTime(playlistTotalDuration || p.duration || 0);
+              cachingStats.textContent = `Remuxing MP4 with ffmpeg.wasm: ${pct}% (${timeStr} / ${totalStr}) [PTS Normalization + Faststart]`;
+            }
+          });
+
+          finalBlob = new Blob([remuxResult.mp4Data], { type: 'video/mp4' });
+          detectedDuration = remuxResult.duration || 0;
+        }
       } catch (remuxErr) {
-        console.warn('ffmpeg.wasm remux failed, falling back to mux.js / raw TS:', remuxErr);
-        showNotice(`ffmpeg.wasm remux notice: ${remuxErr.message}. Output assembled via mux.js.`, 'error');
+        console.warn('ffmpeg.wasm remux error, falling back to assembled parts:', remuxErr);
+        showNotice(`ffmpeg.wasm remux notice: ${remuxErr.message}. Falling back to assembled chunks.`, 'error');
         if (fallbackBanner) fallbackBanner.classList.remove('hidden');
         finalBlob = new Blob(assembledBlobParts, { type: 'video/mp4' });
       }
@@ -984,7 +1565,7 @@
       finalBlob = new Blob(assembledBlobParts, { type: mimeType });
     }
 
-    // Write to writableStream if direct disk streaming was selected
+    // Direct disk streaming final write
     if (writableStream) {
       try {
         const arrayBuf = await finalBlob.arrayBuffer();
@@ -998,6 +1579,8 @@
 
         const actualDur = detectedDuration > 0 ? detectedDuration : await getBlobDuration(finalBlob);
         runDurationSanityCheck(actualDur, playlistTotalDuration);
+
+        if (typeof SegmentStore !== 'undefined') SegmentStore.clearDownload(sessionDownloadId).catch(() => {});
         return;
       } catch (err) {
         console.error('Error streaming final blob to disk:', err);
@@ -1007,17 +1590,22 @@
     // Trigger browser download
     triggerBlobDownload(finalBlob, finalFilename);
 
-    setStatus('Download Complete!', false);
+    setStatus('Done', false);
     updatePipelineStep('completed', 'Step 3: Download Complete');
     progressBarFill.style.width = '100%';
     progressBarBuffered.style.width = '100%';
 
-    cachingStats.textContent = `✅ All ${segmentsList.length} segments merged! Downloaded: ${finalFilename} (${formatBytes(finalBlob.size)})`;
+    cachingStats.textContent = `Download complete: ${segmentsList.length}/${segmentsList.length} segments, ${formatBytes(finalBlob.size)} (${finalFilename})`;
     showNotice(`🎉 Downloaded successfully: ${finalFilename} (${formatBytes(finalBlob.size)})`, 'success');
 
-    // Post-download Sanity Check (Requirement 5)
+    // Post-download Sanity Check (Section C.7)
     const finalMediaDuration = detectedDuration > 0 ? detectedDuration : await getBlobDuration(finalBlob);
     runDurationSanityCheck(finalMediaDuration, playlistTotalDuration);
+
+    // Clean up IndexedDB storage
+    if (typeof SegmentStore !== 'undefined') {
+      SegmentStore.clearDownload(sessionDownloadId).catch(() => {});
+    }
   }
 
   function startSpeedMonitor() {
@@ -1043,13 +1631,13 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 11. Live Stream Recording
+  // 12. Live Stream Recording
   // ---------------------------------------------------------------------------
   async function pollLivePlaylist() {
     if (!isRecordingLive || isPaused || isCancelled) return;
     try {
-      const { text, status } = await fetchPlaylistText(playlistUrl);
-      const parsed = parseM3U8Content(text, playlistUrl, status);
+      const res = await fetchWithStrategy(playlistUrl, { isPlaylist: true, responseType: 'text' });
+      const parsed = parseM3U8Content(res.text, playlistUrl, res.status);
       if (parsed && Array.isArray(parsed.segments)) {
         const existingUrls = new Set(segmentsList.map(s => s.url));
         const newSegs = [];
@@ -1097,196 +1685,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 12. Setup & Initialization
-  // ---------------------------------------------------------------------------
-  async function setupHlsStream(url) {
-    setStatus('Parsing HLS Playlist...', true);
-    hideNotice();
-
-    try {
-      const { text, status } = await fetchPlaylistText(url);
-      const parsed = parseM3U8Content(text, url, status);
-
-      // 1. DRM Check
-      if (parsed.isDrmProtected) {
-        isDrmProtected = true;
-        drmBanner.classList.remove('hidden');
-        setStatus('DRM-Protected Stream', false);
-        updatePipelineStep('error', "DRM-protected, can't be downloaded");
-        saveBtn.disabled = true;
-        saveBtn.style.opacity = '0.5';
-        showNotice("DRM-protected, can't be downloaded", 'error');
-        return;
-      }
-
-      // 2. Master Playlist with variants
-      if (parsed.type === 'master') {
-        isMasterPlaylist = true;
-        qualitySection.classList.remove('hidden');
-        qualitySelect.innerHTML = '';
-
-        parsed.variants.sort((a, b) => b.bandwidth - a.bandwidth);
-        parsed.variants.forEach((v, i) => {
-          const opt = document.createElement('option');
-          opt.value = v.url;
-          if (v.audioUrl) opt.dataset.audioUrl = v.audioUrl;
-          const res = v.resolution ? `${v.resolution}` : `Variant ${i + 1}`;
-          const kbps = v.bandwidth ? ` (${Math.round(v.bandwidth / 1000)} kbps)` : '';
-          opt.textContent = `${res}${kbps}`;
-          qualitySelect.appendChild(opt);
-        });
-
-        // Use variant from query or highest quality
-        const chosen = variantUrl && parsed.variants.some(v => v.url === variantUrl)
-          ? variantUrl
-          : parsed.variants[0].url;
-
-        qualitySelect.value = chosen;
-        const { text: subText, status: subStatus } = await fetchPlaylistText(chosen);
-        const subParsed = parseM3U8Content(subText, chosen, subStatus);
-        setupMediaPlaylist(subParsed);
-      } else {
-        setupMediaPlaylist(parsed);
-      }
-    } catch (err) {
-      console.warn('Playlist load error, checking if direct stream:', err);
-      if (err.message && (err.message.includes('Missing #EXTM3U tag') || err.message.includes('Server returned an HTML page') || err.message.includes('Invalid M3U8'))) {
-        // Fallback to multi-threaded direct chunk download
-        setupDirectChunkDownload(url, originalTitle);
-        return;
-      }
-      setStatus('Failed to load playlist', false);
-      updatePipelineStep('error', 'Load Failed');
-      showNotice(`Failed to load or parse playlist: ${err.message}`, 'error', true);
-    }
-  }
-
-  async function setupDirectChunkDownload(rawUrl, title) {
-    isDirectStream = true;
-    setStatus('Probing Media Stream...', true);
-    hideNotice();
-
-    const cleanUrl = cleanMediaUrl(rawUrl);
-    let totalSize = parseInt(params.get('size'), 10) || 0;
-    let detectedMime = '';
-
-    // Check query params (e.g. YouTube videoplayback clen)
-    try {
-      const u = new URL(cleanUrl);
-      const clen = u.searchParams.get('clen');
-      if (clen && parseInt(clen, 10) > 65536) {
-        totalSize = parseInt(clen, 10);
-      }
-      const mime = u.searchParams.get('mime');
-      if (mime) detectedMime = mime;
-    } catch {}
-
-    // Background SW probe (bypasses CORS and gets accurate Content-Length / Range)
-    if (!totalSize) {
-      try {
-        const probeRes = await new Promise(resolve => {
-          chrome.runtime.sendMessage({ action: 'probeMedia', url: cleanUrl }, resolve);
-        });
-        if (probeRes && probeRes.success) {
-          const probedSize = probeRes.totalSize || (probeRes.primary && probeRes.primary.totalSize) || 0;
-          const probedMime = probeRes.mimeType || (probeRes.primary && probeRes.primary.mimeType) || '';
-          if (probedSize > 65536) {
-            totalSize = probedSize;
-          }
-          if (probedMime) {
-            detectedMime = probedMime;
-          }
-        }
-      } catch (e) {
-        console.warn('Probe background check note:', e);
-      }
-    }
-
-    // Determine extension based on type / mime
-    const isAudio = streamType === 'audio' ||
-                    detectedMime.includes('audio') ||
-                    cleanUrl.includes('mime=audio') ||
-                    cleanUrl.includes('mime%2faudio');
-
-    let defaultExt = isAudio ? 'm4a' : 'mp4';
-    if (detectedMime.includes('webm')) defaultExt = isAudio ? 'weba' : 'webm';
-    else if (detectedMime.includes('mp3') || cleanUrl.endsWith('.mp3')) defaultExt = 'mp3';
-    else if (detectedMime.includes('mp4') || cleanUrl.endsWith('.mp4')) defaultExt = 'mp4';
-
-    outputFormatSelect.value = defaultExt;
-    if (fileExtLabel) fileExtLabel.textContent = `.${defaultExt}`;
-    const safeTitle = cleanFilename(filenameInput.value || title || originalTitle);
-    cachingFilename.textContent = `${safeTitle}.${defaultExt}`;
-
-    segmentsList = [];
-    downloadedBuffers = {};
-
-    if (totalSize > 0) {
-      // Split into 1MB chunks (or 512KB for small files)
-      const CHUNK_SIZE = totalSize <= 4 * 1048576 ? 524288 : 1048576;
-      let offset = 0;
-      while (offset < totalSize) {
-        const end = Math.min(offset + CHUNK_SIZE - 1, totalSize - 1);
-        segmentsList.push({
-          url: cleanUrl,
-          range: `bytes=${offset}-${end}`,
-          start: offset,
-          end: end,
-          size: end - offset + 1,
-          index: segmentsList.length,
-          isDirect: true
-        });
-        offset = end + 1;
-      }
-    } else {
-      // Single continuous segment
-      segmentsList.push({
-        url: cleanUrl,
-        range: null,
-        index: 0,
-        isDirect: true
-      });
-    }
-
-    segmentStatus = new Array(segmentsList.length).fill('waiting');
-    buildSegmentGrid(segmentsList.length);
-    setStatus('Ready to Download', false);
-    updatePipelineStep('downloading', `Step 1: Downloading Segments (${segmentsList.length})`);
-
-    startDownload();
-  }
-
-  function setupMediaPlaylist(parsed) {
-    isLiveStream = !parsed.hasEndList;
-    isFmp4 = parsed.isFmp4;
-    targetDurationSec = parsed.targetDuration || 6;
-    mediaSequenceBase = parsed.mediaSequence || 0;
-    playlistTotalDuration = parsed.totalDuration || (parsed.segments ? parsed.segments.reduce((acc, s) => acc + (s.duration || 0), 0) : 0);
-
-    if (parsed.initSegment) {
-      initSegmentUrl = parsed.initSegment.url;
-    }
-
-    segmentsList = parsed.segments.map((s, idx) => ({ ...s, index: idx }));
-    downloadedBuffers = {};
-    segmentStatus = new Array(segmentsList.length).fill('waiting');
-
-    buildSegmentGrid(segmentsList.length);
-
-    // Live stream banner
-    if (isLiveStream) {
-      liveBanner.classList.remove('hidden');
-      setStatus('Live Stream Ready', false);
-      showNotice('Live stream detected. Click "Record Live Stream" to begin capturing.', 'success');
-      return;
-    }
-
-    setStatus('Stream Ready', false);
-    startDownload();
-  }
-
-  // ---------------------------------------------------------------------------
-  // 13. Event Listeners
+  // 13. Event Listeners & Controls
   // ---------------------------------------------------------------------------
   function enableTurbo() {
     concurrency = 16;
@@ -1312,6 +1711,25 @@
   if (cancelBtn) cancelBtn.addEventListener('click', cancelDownload);
   if (saveBtn) saveBtn.addEventListener('click', finishDownload);
   if (saveRawTsBtn) saveRawTsBtn.addEventListener('click', saveRawTsFallback);
+
+  if (pickerStartBtn) pickerStartBtn.addEventListener('click', handlePickerStart);
+  if (pickerCancelBtn) pickerCancelBtn.addEventListener('click', handlePickerCancel);
+
+  if (challengeRetryBtn) {
+    challengeRetryBtn.addEventListener('click', async () => {
+      hideAllAlertBanners();
+      await initRequestContext(playlistUrl);
+      setupHlsStream(playlistUrl);
+    });
+  }
+
+  if (expiredRetryBtn) {
+    expiredRetryBtn.addEventListener('click', async () => {
+      hideAllAlertBanners();
+      await initRequestContext(playlistUrl);
+      setupHlsStream(playlistUrl);
+    });
+  }
 
   if (copyCmdBtn) {
     copyCmdBtn.addEventListener('click', () => {
@@ -1380,24 +1798,10 @@
     });
   }
 
-  if (qualitySelect) {
-    qualitySelect.addEventListener('change', async () => {
-      const newUrl = qualitySelect.value;
-      if (newUrl) {
-        if (isDownloading) cancelDownload();
-        const { text, status } = await fetchPlaylistText(newUrl);
-        const parsed = parseM3U8Content(text, newUrl, status);
-        setupMediaPlaylist(parsed);
-      }
-    });
-  }
-
   // ---------------------------------------------------------------------------
   // 14. Init
   // ---------------------------------------------------------------------------
-  function init() {
-    applyRequestHeaders();
-
+  async function init() {
     urlDisplay.value = playlistUrl;
     streamTypeBadge.textContent = streamType.toUpperCase();
 
@@ -1405,13 +1809,16 @@
     filenameInput.value = safeName.replace(/\.(mp4|ts|m3u8|m4a|webm|mp3)$/i, '');
     const ext = requestedFormat === 'ts' ? 'ts' : (streamType === 'audio' ? 'm4a' : 'mp4');
     outputFormatSelect.value = ext;
-    fileExtLabel.textContent = `.${ext}`;
+    if (fileExtLabel) fileExtLabel.textContent = `.${ext}`;
     cachingFilename.textContent = `${filenameInput.value}.${ext}`;
 
     if (!playlistUrl) {
       showNotice('No media URL provided. Please open this page from the extension popup.', 'error');
       return;
     }
+
+    // Step 1: Initialize Request Context from background & install scoped DNR session rules
+    await initRequestContext(playlistUrl);
 
     const isHls = streamType === 'hls' ||
                   streamType === 'm3u8' ||
@@ -1427,4 +1834,3 @@
 
   init();
 })();
-
