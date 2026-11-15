@@ -104,7 +104,6 @@
     const rawUrl = toCleanString(url);
     if (!rawUrl) return false;
     const lower = rawUrl.toLowerCase();
-    if (lower.includes('googlevideo.com/videoplayback') || lower.includes('/videoplayback')) return true;
     if (lower.includes('.m3u8') || lower.includes('.mpd')) return true;
     if (lower.includes('mime=video') || lower.includes('mime=audio')) return true;
     if (lower.includes('mime%2fvideo') || lower.includes('mime%2faudio')) return true;
@@ -240,59 +239,6 @@
 
     return promise;
   };
-
-  // -------------------------------------------------------------------
-  // 4.1 Scan YouTube Player Data (Direct streams with title & video+audio)
-  // -------------------------------------------------------------------
-
-  function scanYouTubePlayerData() {
-    try {
-      const pr = window.ytInitialPlayerResponse ||
-                 (window.ytplayer && window.ytplayer.config && window.ytplayer.config.args && window.ytplayer.config.args.raw_player_response);
-      if (!pr || !pr.streamingData) return;
-
-      const title = pr.videoDetails ? pr.videoDetails.title : document.title.replace(/\s*-\s*YouTube$/i, '');
-      const formats = pr.streamingData.formats || [];
-      const adaptive = pr.streamingData.adaptiveFormats || [];
-
-      // formats: streams that contain BOTH video AND audio together (360p, 720p MP4)
-      for (const f of formats) {
-        if (f.url) {
-          postDetected(f.url, 'youtube-player', 'video', f.contentLength, {
-            title: `${title} [${f.qualityLabel || '720p'} Video+Audio]`,
-            hasAudio: true,
-            resolution: f.qualityLabel || '720p',
-            format: 'mp4'
-          });
-        }
-      }
-
-      // adaptiveFormats: separate high-res video (1080p, 4K) & audio tracks
-      for (const f of adaptive) {
-        if (f.url) {
-          const isVideo = (f.mimeType || '').startsWith('video/');
-          const isAudio = (f.mimeType || '').startsWith('audio/');
-          const label = isVideo ? (f.qualityLabel || 'Video') : (f.audioQuality ? f.audioQuality.replace('AUDIO_QUALITY_', '') : 'Audio');
-          postDetected(f.url, 'youtube-player', isVideo ? 'video' : (isAudio ? 'audio' : 'video'), f.contentLength, {
-            title: `${title} [${label}]`,
-            hasAudio: false,
-            resolution: isVideo ? f.qualityLabel : '',
-            quality: isAudio ? `${Math.round((f.bitrate || 128000) / 1000)} kbps` : '',
-            format: isVideo ? ((f.mimeType || '').includes('webm') ? 'webm' : 'mp4') : ((f.mimeType || '').includes('webm') ? 'webm' : 'm4a')
-          });
-        }
-      }
-    } catch (e) {
-      // ignore
-    }
-  }
-
-  // Scan YouTube player data periodically and on navigation
-  if (location.hostname.includes('youtube.com')) {
-    window.addEventListener('yt-navigate-finish', () => setTimeout(scanYouTubePlayerData, 1000));
-    window.addEventListener('DOMContentLoaded', () => setTimeout(scanYouTubePlayerData, 1500));
-    setInterval(scanYouTubePlayerData, 3000);
-  }
 
   // -------------------------------------------------------------------
   // 5. Intercept HTMLMediaElement.prototype.src setter

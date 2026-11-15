@@ -49,6 +49,20 @@
   let ownTabId = null;
   const installedDnrHosts = new Set();
 
+  async function getOwnTabId() {
+    if (ownTabId && ownTabId !== -1) return ownTabId;
+    if (typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.getCurrent) {
+      try {
+        const tab = await new Promise(r => chrome.tabs.getCurrent(r));
+        if (tab && tab.id) {
+          ownTabId = tab.id;
+          return ownTabId;
+        }
+      } catch (_) {}
+    }
+    return ownTabId || -1;
+  }
+
   if (typeof chrome !== 'undefined' && chrome.tabs) {
     if (chrome.tabs.getCurrent) {
       chrome.tabs.getCurrent((tab) => {
@@ -486,6 +500,17 @@
     console.log(`[Diagnostic] [${item.strategy}] ${item.url} -> HTTP ${item.status || 'ERR'} (${item.contentType || ''})`, item);
   }
 
+  function escapeHtml(text) {
+    if (!text && text !== 0) return '';
+    const str = String(text);
+    return str
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
   function renderDebugEntry(item) {
     if (!debugLogsContainer) return;
     const emptyMsg = debugLogsContainer.querySelector('.debug-empty-msg');
@@ -500,17 +525,17 @@
 
     el.innerHTML = `
       <div class="debug-log-header">
-        <span class="debug-log-strat">${item.strategy}</span>
-        <span class="debug-log-status status-${item.status || 'err'}">HTTP ${item.status || 'ERR'}${item.statusText ? ' ' + item.statusText : ''}</span>
+        <span class="debug-log-strat">${escapeHtml(item.strategy)}</span>
+        <span class="debug-log-status status-${item.status || 'err'}">HTTP ${item.status || 'ERR'}${item.statusText ? ' ' + escapeHtml(item.statusText) : ''}</span>
       </div>
-      <div class="debug-log-url">${cleanUrl}</div>
+      <div class="debug-log-url">${escapeHtml(cleanUrl)}</div>
       <div class="debug-log-details">
-        <div><strong>Frame:</strong> id=${item.frameId !== undefined ? item.frameId : '0'}, url=${item.frameUrl ? redactSensitive(item.frameUrl) : 'top-level'}</div>
+        <div><strong>Frame:</strong> id=${item.frameId !== undefined ? item.frameId : '0'}, url=${item.frameUrl ? escapeHtml(redactSensitive(item.frameUrl)) : 'top-level'}</div>
         <div><strong>Cache Used:</strong> ${item.cacheUsed ? '<span class="badge-cache">YES (In-Page)</span>' : 'NO (Network)'}</div>
-        <div><strong>Content-Type:</strong> ${item.contentType || 'unknown'}, <strong>Final URL:</strong> ${item.finalUrl ? redactSensitive(item.finalUrl) : 'same'}, <strong>Redirected:</strong> ${!!item.redirected}</div>
-        ${item.sentHeaders && Object.keys(item.sentHeaders).length > 0 ? `<div><strong>Headers Sent:</strong> ${redactSensitive(JSON.stringify(item.sentHeaders))}</div>` : ''}
+        <div><strong>Content-Type:</strong> ${escapeHtml(item.contentType || 'unknown')}, <strong>Final URL:</strong> ${item.finalUrl ? escapeHtml(redactSensitive(item.finalUrl)) : 'same'}, <strong>Redirected:</strong> ${!!item.redirected}</div>
+        ${item.sentHeaders && Object.keys(item.sentHeaders).length > 0 ? `<div><strong>Headers Sent:</strong> ${escapeHtml(redactSensitive(JSON.stringify(item.sentHeaders)))}</div>` : ''}
         ${item.dnrMatched !== undefined ? `<div><strong>DNR Rule Match:</strong> ${item.dnrMatched ? 'YES (Rule ' + item.ruleId + ' fired)' : 'NO'}</div>` : ''}
-        ${preview ? `<div class="debug-log-preview">${preview}</div>` : ''}
+        ${preview ? `<div class="debug-log-preview">${escapeHtml(preview)}</div>` : ''}
       </div>
     `;
     debugLogsContainer.appendChild(el);
@@ -666,6 +691,7 @@
           };
 
       currentOrigin = resolved.origin;
+      const dlTabId = await getOwnTabId();
 
       await new Promise((resolve) => {
         chrome.runtime.sendMessage({
@@ -674,7 +700,7 @@
           url: targetUrl,
           urls: urlList,
           hosts,
-          downloaderTabId: ownTabId,
+          downloaderTabId: dlTabId,
           frameUrl: currentFrameUrl,
           referer: resolved.referer,
           origin: resolved.origin,
@@ -690,8 +716,14 @@
         });
       });
 
+      let dnrMatched = true;
+      try {
+        const uHost = new URL(url).host;
+        dnrMatched = installedDnrHosts.has(uHost);
+      } catch (_) {}
+
       if (debugDnrStatus) {
-        debugDnrStatus.textContent = `Installed (Rule ${DNR_RULE_ID})`;
+        debugDnrStatus.textContent = dnrMatched ? `Installed (Rule ${DNR_RULE_ID})` : `Pending (Rule ${DNR_RULE_ID})`;
       }
     } catch (err) {
       console.warn('[DNR] Error setting download headers:', err);
@@ -1150,19 +1182,14 @@
         return { ok: false, status: 0, error: fErr.message };
       }
 
-      // Check matched rules from background (Requirement 2.C & 3)
-      let dnrMatched = false;
+      let dnrMatched = true;
       try {
-        const matchedCheck = await new Promise(resolve => {
-          chrome.runtime.sendMessage({ action: 'getMatchedRules' }, resolve);
-        });
-        if (matchedCheck && matchedCheck.success && Array.isArray(matchedCheck.rulesMatchedInfo)) {
-          dnrMatched = matchedCheck.rulesMatchedInfo.some(r => r.rule && r.rule.ruleId === DNR_RULE_ID);
-        }
+        const uHost = new URL(url).host;
+        dnrMatched = installedDnrHosts.has(uHost);
       } catch (_) {}
 
       if (debugDnrStatus) {
-        debugDnrStatus.textContent = dnrMatched ? `Rule ${DNR_RULE_ID} Fired (Active)` : `Installed (Rule ${DNR_RULE_ID})`;
+        debugDnrStatus.textContent = dnrMatched ? `Installed (Rule ${DNR_RULE_ID})` : `Pending (Rule ${DNR_RULE_ID})`;
       }
 
       // Check expired URL first
@@ -1313,7 +1340,8 @@
     }
 
     // If working strategy has already been established, reuse it immediately (Requirement 2.D)
-    if (workingStrategy) {
+    // For media segments, prioritize header-replay to avoid IPC overhead and tab dependency
+    if (workingStrategy && (isPlaylist || workingStrategy === 'header-replay')) {
       try {
         const res = await executeStrategy(workingStrategy, url, { responseType, isPlaylist, headers, signal });
         if (res && res.ok) return res;
@@ -1329,9 +1357,10 @@
       updateDebugActiveStrategy('header-replay (standalone)');
     }
 
-    // Try strategy chain in order: A (same-frame) -> B (content-script) -> C (header-replay)
-    const strategies = isTabClosed
-      ? ['header-replay']
+    // For media segments (non-playlist), prioritize 'header-replay' so downloads are fast,
+    // zero-IPC, robust, and work even when the stream tab is closed.
+    const strategies = (!isPlaylist || isTabClosed)
+      ? ['header-replay', 'same-frame', 'content-script']
       : ['same-frame', 'content-script', 'header-replay'];
     let lastError = null;
     let lastStatus = 0;
@@ -1447,21 +1476,21 @@
       }
 
       card.innerHTML = `
-        <input type="radio" name="variant_pick" class="variant-radio" value="${v.url}" ${index === preselectedIndex ? 'checked' : ''}>
+        <input type="radio" name="variant_pick" class="variant-radio" value="${escapeHtml(v.url)}" ${index === preselectedIndex ? 'checked' : ''}>
         <div class="variant-info">
           <div class="variant-title-line">
-            <span class="variant-title">${resLabel}</span>
-            <span class="variant-badge-res">${dims}</span>
+            <span class="variant-title">${escapeHtml(resLabel)}</span>
+            <span class="variant-badge-res">${escapeHtml(dims)}</span>
             ${index === 0 ? '<span class="variant-badge-best">BEST</span>' : ''}
           </div>
           <div class="variant-meta">
-            ${fps ? `<span>🎞️ ${fps}</span>` : ''}
-            <span>⚙️ ${codecInfo.label}</span>
+            ${fps ? `<span>🎞️ ${escapeHtml(fps)}</span>` : ''}
+            <span>⚙️ ${escapeHtml(codecInfo.label)}</span>
           </div>
         </div>
         <div class="variant-size-col">
-          <span class="variant-size-value">${sizeStr}</span>
-          <span class="variant-bitrate-value">${bitrateStr}</span>
+          <span class="variant-size-value">${escapeHtml(sizeStr)}</span>
+          <span class="variant-bitrate-value">${escapeHtml(bitrateStr)}</span>
         </div>
       `;
 
@@ -1511,8 +1540,8 @@
         const item = document.createElement('label');
         item.className = 'subtitle-item';
         item.innerHTML = `
-          <input type="checkbox" value="${sub.url}" data-lang="${sub.language || ''}" data-name="${sub.name || ''}">
-          <span>${sub.name || sub.language || `Subtitle ${idx + 1}`} (${sub.language || 'und'})</span>
+          <input type="checkbox" value="${escapeHtml(sub.url)}" data-lang="${escapeHtml(sub.language || '')}" data-name="${escapeHtml(sub.name || '')}">
+          <span>${escapeHtml(sub.name || sub.language || `Subtitle ${idx + 1}`)} (${escapeHtml(sub.language || 'und')})</span>
         `;
         pickerSubtitlesList.appendChild(item);
       });
@@ -1915,6 +1944,22 @@
   // ---------------------------------------------------------------------------
   // 11. Worker Pool & Download Loop (Requirement 2.D)
   // ---------------------------------------------------------------------------
+  const aesKeyCache = new Map();
+  async function fetchAesKeyBuffer(uri) {
+    if (!uri) return null;
+    if (aesKeyCache.has(uri)) return aesKeyCache.get(uri);
+    try {
+      const res = await fetchWithStrategy(uri, { responseType: 'arraybuffer', isPlaylist: false });
+      if (res && res.ok && res.buffer) {
+        aesKeyCache.set(uri, res.buffer);
+        return res.buffer;
+      }
+    } catch (e) {
+      console.warn('[AES-128] fetchWithStrategy key note:', e);
+    }
+    return null;
+  }
+
   async function downloadSegmentWithRetry(seg, retries = 3) {
     let lastErr = null;
     for (let attempt = 0; attempt < retries; attempt++) {
@@ -1925,14 +1970,6 @@
 
         if (seg.range) {
           fetchHeaders['Range'] = seg.range;
-          if (fetchUrl.includes('googlevideo.com') || fetchUrl.includes('videoplayback')) {
-            const rangeVal = seg.range.replace('bytes=', '');
-            try {
-              const u = new URL(fetchUrl);
-              u.searchParams.set('range', rangeVal);
-              fetchUrl = u.href;
-            } catch {}
-          }
         }
 
         // Segments are downloaded using the established working strategy (Requirement 2.D)
@@ -1950,10 +1987,14 @@
 
         // AES-128 Decryption before storage (SegmentStore IndexedDB)
         if (seg.encryption && seg.encryption.method === 'AES-128' && typeof SegmentStore !== 'undefined') {
+          let keyRaw = null;
+          if (seg.encryption.uri) {
+            keyRaw = await fetchAesKeyBuffer(seg.encryption.uri);
+          }
           if (typeof SegmentStore.decryptSegmentBuffer === 'function') {
-            rawBuf = await SegmentStore.decryptSegmentBuffer(rawBuf, seg.encryption, seg.sequence);
+            rawBuf = await SegmentStore.decryptSegmentBuffer(rawBuf, seg.encryption, seg.sequence, keyRaw);
           } else {
-            await SegmentStore.decryptAndStore(sessionDownloadId, seg.index, rawBuf, seg.encryption, seg.sequence);
+            await SegmentStore.decryptAndStore(sessionDownloadId, seg.index, rawBuf, seg.encryption, seg.sequence, {}, keyRaw);
             const decrypted = await SegmentStore.getSegment(sessionDownloadId, seg.index);
             if (decrypted) rawBuf = decrypted.data ? (decrypted.data.buffer || decrypted.data) : decrypted;
           }
@@ -2042,10 +2083,25 @@
     if (!isDownloading || isCancelled || isPaused) return;
     const total = segmentsList.length;
     const completed = segmentStatus.filter(s => s === 'done').length;
+    const errors = segmentStatus.filter(s => s === 'error').length;
 
-    if (completed === total && total > 0 && activeWorkers === 0) {
-      if (isRecordingLive) return;
-      finishDownload();
+    if (total > 0 && activeWorkers === 0) {
+      if (completed === total) {
+        if (isRecordingLive) return;
+        finishDownload();
+      } else if (completed + errors === total) {
+        if (completed > 0) {
+          showNotice(`${errors} segment(s) failed out of ${total}. Click "Retry" to download failed segments, or wait to assemble available parts.`, 'warning', true);
+          // If the user wants to finish with whatever segments are downloaded
+          setTimeout(() => {
+            if (!isDownloading && !isCancelled && completed > 0 && activeWorkers === 0) {
+              finishDownload();
+            }
+          }, 3500);
+        } else {
+          showNotice(`Failed to download segments. Please check network connection and click Retry.`, 'error', true);
+        }
+      }
     }
   }
 
@@ -2238,7 +2294,8 @@
           record = await SegmentStore.getSegment(sessionDownloadId, i);
         }
         if (!record || !record.data) {
-          throw new Error(`Missing segment ${i + 1}/${totalSegments} in IndexedDB.`);
+          console.warn(`[Pipeline Step 3] Segment ${i + 1}/${totalSegments} missing in IndexedDB, skipping.`);
+          continue;
         }
         const u8 = record.data instanceof Uint8Array ? record.data : new Uint8Array(record.data);
         tsParts.push(u8);
@@ -2250,11 +2307,15 @@
         cachingStats.textContent = `Merging segments in TS format: ${i + 1} / ${totalSegments} (${mergePct}%) — ${formatBytes(totalMergedBytes)}`;
       }
 
+      if (tsParts.length === 0) {
+        throw new Error('No valid segments found in IndexedDB to merge.');
+      }
+
       // Concatenate all segment buffers into a single continuous MPEG-TS
       mergedTsBuffer = concatBuffers(tsParts);
       mergedTsBlob = new Blob([mergedTsBuffer], { type: 'video/mp2t' });
       rawTsChunks = [mergedTsBuffer]; // Keep populated for fallback references
-      console.log(`[Pipeline Step 3] Merged TS created: ${mergedTsBuffer.byteLength} bytes (${formatBytes(mergedTsBuffer.byteLength)}) from ${totalSegments} segments.`);
+      console.log(`[Pipeline Step 3] Merged TS created: ${mergedTsBuffer.byteLength} bytes (${formatBytes(mergedTsBuffer.byteLength)}) from ${tsParts.length} segments.`);
 
       // Update manual TS command & display
       updateFfmpegCommand(safeTitle);
@@ -2292,26 +2353,52 @@
           console.log(`[Pipeline Step 4] FFmpeg conversion complete: MP4 size: ${finalMp4Blob.size} bytes (${formatBytes(finalMp4Blob.size)}), Duration: ${detectedDuration}s`);
         } catch (remuxErr) {
           console.warn('[Pipeline Step 4] FFmpeg remux error, trying TransmuxEngine fallback:', remuxErr);
-          showNotice(`FFmpeg conversion warning: ${remuxErr.message}. Falling back to mux.js transmuxer...`, 'warning');
+          showNotice(`FFmpeg conversion note: ${remuxErr.message}. Completing via TransmuxEngine...`, 'warning');
 
           if (typeof TransmuxEngine !== 'undefined') {
             try {
-              const transmuxer = new TransmuxEngine.TransmuxSession({
-                onData: () => {},
-                isFmp4: false
-              });
-              for (const part of tsParts) {
-                transmuxer.push(part);
-                transmuxer.flush();
+              let assembled = [];
+              if (typeof TransmuxEngine.TransmuxSession === 'function') {
+                const transmuxer = new TransmuxEngine.TransmuxSession({ isFmp4: false });
+                for (const part of tsParts) {
+                  transmuxer.push(part);
+                  transmuxer.flush();
+                }
+                assembled = transmuxer.getAssembledBoxes();
+              } else if (typeof TransmuxEngine.createTransmuxer === 'function') {
+                const chunks = [];
+                const transmuxer = TransmuxEngine.createTransmuxer({
+                  onInit: (initData) => chunks.push(initData),
+                  onData: (data) => chunks.push(data)
+                });
+                for (const part of tsParts) {
+                  transmuxer.push(part);
+                }
+                transmuxer.finish();
+                assembled = chunks;
               }
-              const assembled = transmuxer.getAssembledBoxes();
               if (assembled && assembled.length > 0) {
                 finalMp4Blob = new Blob(assembled, { type: 'video/mp4' });
+                console.log(`[Pipeline Step 4] TransmuxEngine complete: MP4 size: ${finalMp4Blob.size} bytes (${formatBytes(finalMp4Blob.size)})`);
               }
             } catch (tErr) {
               console.error('TransmuxEngine fallback also failed:', tErr);
             }
           }
+        }
+      } else if (typeof TransmuxEngine !== 'undefined') {
+        try {
+          const transmuxer = new TransmuxEngine.TransmuxSession({ isFmp4: false });
+          for (const part of tsParts) {
+            transmuxer.push(part);
+            transmuxer.flush();
+          }
+          const assembled = transmuxer.getAssembledBoxes();
+          if (assembled && assembled.length > 0) {
+            finalMp4Blob = new Blob(assembled, { type: 'video/mp4' });
+          }
+        } catch (tErr) {
+          console.error('TransmuxEngine direct conversion failed:', tErr);
         }
       }
 
@@ -2537,7 +2624,23 @@
     retryBtn.addEventListener('click', () => {
       hideNotice();
       if (segmentsList.length > 0) {
-        startDownload();
+        const hasErrors = segmentStatus.some(s => s === 'error');
+        if (hasErrors) {
+          segmentStatus.forEach((st, i) => {
+            if (st === 'error') {
+              segmentStatus[i] = 'waiting';
+              updateSegmentBlock(i, 'waiting');
+            }
+          });
+          nextSegmentIndex = 0;
+          isDownloading = true;
+          isPaused = false;
+          for (let i = 0; i < concurrency; i++) {
+            workerLoop();
+          }
+        } else {
+          startDownload();
+        }
       } else {
         setupHlsStream(playlistUrl);
       }

@@ -883,6 +883,39 @@ segment_2.ts
     assert.ok(epCsp.includes("'wasm-unsafe-eval'"), "extension_pages CSP must include 'wasm-unsafe-eval' for WebAssembly compilation");
   });
 
+  it('TransmuxSession constructor: TransmuxEngine provides TransmuxSession and createTransmuxer', () => {
+    const fakeMuxLib = {
+      mp4: {
+        Transmuxer: function () {
+          this.on = function () {};
+          this.push = function () {};
+          this.flush = function () {};
+          this.setBaseMediaDecodeTime = function () {};
+        }
+      }
+    };
+    const origWindowMux = (typeof window !== 'undefined' ? window.muxjs : null);
+    if (typeof window === 'undefined') {
+      global.window = { muxjs: fakeMuxLib };
+    } else {
+      window.muxjs = fakeMuxLib;
+    }
+
+    const TransmuxEngine = require('./transmux.js');
+    assert.strictEqual(typeof TransmuxEngine.createTransmuxer, 'function', 'createTransmuxer must be exported');
+    assert.strictEqual(typeof TransmuxEngine.TransmuxSession, 'function', 'TransmuxSession constructor must be exported');
+    const session = new TransmuxEngine.TransmuxSession();
+    assert.strictEqual(typeof session.push, 'function', 'session.push must be function');
+    assert.strictEqual(typeof session.flush, 'function', 'session.flush must be function');
+    assert.strictEqual(typeof session.getAssembledBoxes, 'function', 'session.getAssembledBoxes must be function');
+
+    if (origWindowMux) {
+      window.muxjs = origWindowMux;
+    } else if (typeof window !== 'undefined') {
+      delete window.muxjs;
+    }
+  });
+
   console.log(`\n========================================`);
   console.log(`Tests Complete: ${passCount} Passed, ${failCount} Failed`);
   console.log(`========================================\n`);

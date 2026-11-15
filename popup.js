@@ -10,17 +10,7 @@
   const refreshBtn = document.getElementById('refresh-btn');
   const openDownloaderBtn = document.getElementById('open-downloader-btn');
   const settingsBtn = document.getElementById('settings-btn');
-
-  // Helper DOM references
-  const helperDot = document.getElementById('helper-status-dot');
-  const helperText = document.getElementById('helper-status-text');
-  const checkHelperBtn = document.getElementById('check-helper-btn');
-  const helperGuideBanner = document.getElementById('helper-guide-banner');
-  const closeHelperGuide = document.getElementById('close-helper-guide');
-  const extIdDisplay = document.getElementById('ext-id-display');
-  const copyExtIdBtn = document.getElementById('copy-ext-id-btn');
-
-  let helperState = { checked: false, installed: false, data: null };
+  const youtubePolicyBanner = document.getElementById('youtube-policy-banner');
 
   // Track active downloads keyed by URL so we can update progress
   const activeDownloads = new Map();
@@ -80,12 +70,10 @@
     if (!item) return 'OTHER';
     const type = (typeof item === 'string' ? item : item.type || '').toLowerCase();
     const hasAudio = typeof item === 'object' ? item.hasAudio : true;
-    const isYt = item && typeof item === 'object' && item.url && (item.url.includes('googlevideo.com') || item.url.includes('videoplayback'));
 
     if (type === 'hls' || type === 'm3u8') return 'HLS STREAM';
     if (type === 'dash' || type === 'mpd') return 'DASH STREAM';
     if (type === 'video') {
-      if (isYt || !hasAudio) return 'VIDEO STREAM';
       return hasAudio ? 'VIDEO + AUDIO' : 'VIDEO ONLY';
     }
     if (type === 'audio') return 'AUDIO ONLY';
@@ -176,12 +164,9 @@
             <div class="media-details">${detailsHTML}</div>
           </div>
           <div class="media-card-actions">
-            <button class="native-dl-btn" data-index="${index}" title="Download via Native Helper (yt-dlp + ffmpeg to ~/Downloads)">
-              ⚡ Native
-            </button>
-            <button class="download-btn browser-dl-btn" data-index="${index}" ${isDash ? 'disabled style="opacity:0.4; cursor:not-allowed;" title="DASH (.mpd) requires Native Helper (yt-dlp + ffmpeg)"' : 'title="Download via In-Browser Downloader (parallel segments, AES-128, disk streaming)"'}>
+            <button class="download-btn browser-dl-btn" data-index="${index}" title="Download via In-Browser Downloader (parallel segments, AES-128, WebAssembly remux)">
               ${createSvg('download')}
-              <span>${isDash ? 'N/A' : 'Browser'}</span>
+              <span>Download</span>
             </button>
           </div>
         </div>
@@ -214,16 +199,9 @@
       statusArea.id = `status-${index}`;
       card.appendChild(statusArea);
 
-      // Attach download click handlers
-      const nativeBtn = card.querySelector('.native-dl-btn');
-      if (nativeBtn) {
-        nativeBtn.addEventListener('click', function () {
-          handleNativeDownload(item, index, card);
-        });
-      }
-
+      // Attach download click handler
       const browserBtn = card.querySelector('.browser-dl-btn');
-      if (browserBtn && !isDash) {
+      if (browserBtn) {
         browserBtn.addEventListener('click', function () {
           handleDownload(item, index, card);
         });
@@ -401,114 +379,8 @@
 
       qualityRow.innerHTML = `
         <span class="quality-label">Format:</span>
-        <span class="quality-info">DASH (.mpd) — Native Helper (yt-dlp)</span>
+        <span class="quality-info">DASH (.mpd)</span>
       `;
-    });
-  }
-
-  // ───────── Native Helper & Download Handlers ─────────
-
-  function checkNativeHelperStatus() {
-    if (helperDot) helperDot.className = 'helper-dot checking';
-    if (helperText) helperText.textContent = 'Helper: Checking...';
-
-    chrome.runtime.sendMessage({ action: 'checkNativeHelper' }, function (res) {
-      if (chrome.runtime.lastError || !res || !res.installed) {
-        helperState.checked = true;
-        helperState.installed = false;
-        helperState.data = null;
-        if (helperDot) helperDot.className = 'helper-dot disconnected';
-        if (helperText) helperText.textContent = 'Helper: Not Installed';
-        if (extIdDisplay) extIdDisplay.textContent = chrome.runtime.id;
-      } else {
-        helperState.checked = true;
-        helperState.installed = true;
-        helperState.data = res.data;
-        if (helperDot) helperDot.className = 'helper-dot connected';
-        const hasBoth = res.data && res.data.dependencies && res.data.dependencies.ytdlp && res.data.dependencies.ffmpeg;
-        if (helperText) {
-          helperText.textContent = hasBoth
-            ? 'Helper: Ready (yt-dlp + ffmpeg)'
-            : 'Helper: Warning (yt-dlp/ffmpeg missing)';
-        }
-        if (helperGuideBanner) helperGuideBanner.classList.add('hidden');
-      }
-    });
-  }
-
-  function showHelperGuide() {
-    if (extIdDisplay) extIdDisplay.textContent = chrome.runtime.id;
-    if (helperGuideBanner) helperGuideBanner.classList.remove('hidden');
-  }
-
-  async function handleNativeDownload(item, index, card) {
-    if (!helperState.installed) {
-      showHelperGuide();
-      alert('Native Helper (yt-dlp + ffmpeg) is not installed.\n\nPlease follow the setup guide at the top of the popup to run the installer script in native-host/.');
-      return;
-    }
-
-    const nativeBtn = card.querySelector('.native-dl-btn');
-    const statusArea = card.querySelector('.status-area');
-    if (nativeBtn) {
-      nativeBtn.disabled = true;
-      nativeBtn.className = 'native-dl-btn downloading';
-      nativeBtn.innerHTML = '<span>⏳ Downloading...</span>';
-    }
-    if (statusArea) {
-      statusArea.classList.remove('hidden');
-      statusArea.innerHTML = '<div style="color:#64b5f6; font-size:11px;">Sending job to yt-dlp... Saving to ~/Downloads</div>';
-    }
-
-    let activePageUrl = item.pageUrl || '';
-    if (!activePageUrl) {
-      try {
-        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (activeTab && activeTab.url) activePageUrl = activeTab.url;
-      } catch {}
-    }
-
-    let downloadUrl = cleanStreamUrl(item.url);
-    const qualitySelect = card.querySelector('.quality-select');
-    if (qualitySelect && qualitySelect.value) {
-      downloadUrl = qualitySelect.value;
-    }
-
-    chrome.runtime.sendMessage({
-      action: 'startNativeDownload',
-      url: downloadUrl,
-      pageUrl: activePageUrl,
-      referer: item.referer || activePageUrl,
-      origin: item.origin || '',
-      ua: item.userAgent || ''
-    }, function (response) {
-      if (chrome.runtime.lastError || !response || !response.success) {
-        const errMsg = response ? response.log || response.error : (chrome.runtime.lastError ? chrome.runtime.lastError.message : 'Download failed');
-        console.error('Native download error:', errMsg);
-        if (nativeBtn) {
-          nativeBtn.disabled = false;
-          nativeBtn.className = 'native-dl-btn failed';
-          nativeBtn.innerHTML = '<span>❌ Failed</span>';
-        }
-        if (statusArea) {
-          statusArea.innerHTML = `
-            <div style="color:#f44336; font-size:11px; margin-bottom:4px;">❌ ${escapeHtml((errMsg || '').slice(0, 150))}...</div>
-            <button class="download-btn browser-dl-btn" style="font-size:10px; padding:3px 8px;">Try Browser Downloader</button>
-          `;
-          const retryBrowserBtn = statusArea.querySelector('.browser-dl-btn');
-          if (retryBrowserBtn) {
-            retryBrowserBtn.addEventListener('click', () => handleDownload(item, index, card));
-          }
-        }
-      } else {
-        if (nativeBtn) {
-          nativeBtn.className = 'native-dl-btn done';
-          nativeBtn.innerHTML = '<span>✅ Saved</span>';
-        }
-        if (statusArea) {
-          statusArea.innerHTML = '<div style="color:#00e676; font-size:11px; font-weight:600;">✅ Saved to ~/Downloads!</div>';
-        }
-      }
     });
   }
 
@@ -782,7 +654,7 @@
       if (!tabs || tabs.length === 0) return;
       const tabId = tabs[0].id;
       const tabUrl = tabs[0].url || '';
-      const isVideoSite = tabUrl.includes('youtube.com') || tabUrl.includes('vimeo.com') || tabUrl.includes('twitch.tv');
+      const isVideoSite = tabUrl.includes('vimeo.com') || tabUrl.includes('twitch.tv') || tabUrl.includes('dailymotion.com');
 
       const banner = document.getElementById('record-banner');
       const recordBtn = document.getElementById('record-btn');
@@ -825,30 +697,14 @@
     checkVideoRecorderStatus();
   });
 
-  if (checkHelperBtn) {
-    checkHelperBtn.addEventListener('click', function () {
-      checkNativeHelperStatus();
-      setTimeout(function () {
-        if (!helperState.installed) {
-          showHelperGuide();
-        }
-      }, 350);
-    });
-  }
-
-  if (closeHelperGuide) {
-    closeHelperGuide.addEventListener('click', function () {
-      if (helperGuideBanner) helperGuideBanner.classList.add('hidden');
-    });
-  }
-
-  if (copyExtIdBtn) {
-    copyExtIdBtn.addEventListener('click', function () {
-      const id = chrome.runtime.id;
-      navigator.clipboard.writeText(id).then(function () {
-        copyExtIdBtn.textContent = 'Copied!';
-        setTimeout(function () { copyExtIdBtn.textContent = 'Copy ID'; }, 2000);
-      });
+  function checkYouTubeNotice() {
+    chrome.tabs.query({ active: true, currentWindow: true }, function (tabs) {
+      if (!tabs || tabs.length === 0) return;
+      const tabUrl = (tabs[0].url || '').toLowerCase();
+      if (tabUrl.includes('youtube.com') || tabUrl.includes('googlevideo.com') || tabUrl.includes('youtube-nocookie.com')) {
+        const ytBanner = document.getElementById('youtube-policy-banner');
+        if (ytBanner) ytBanner.classList.remove('hidden');
+      }
     });
   }
 
@@ -867,7 +723,7 @@
 
   // ───────── Init ─────────
 
-  checkNativeHelperStatus();
+  checkYouTubeNotice();
   loadMedia();
   checkVideoRecorderStatus();
 })();

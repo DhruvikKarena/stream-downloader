@@ -92,8 +92,25 @@
    * @param {Function} [options.onData] - Called for every fragmented media chunk.
    * @param {Function} [options.onError] - Error callback.
    */
+  function getMuxJsLib() {
+    if (typeof window !== 'undefined' && window.muxjs) return window.muxjs;
+    if (typeof muxjs !== 'undefined') return muxjs;
+    if (typeof global !== 'undefined' && global.window && global.window.muxjs) return global.window.muxjs;
+    if (typeof require === 'function') {
+      try {
+        if (typeof global !== 'undefined' && !global.window) {
+          global.window = {};
+        }
+        const m = require('./lib/mux.min.js');
+        if (m && m.mp4) return m;
+        if (typeof global !== 'undefined' && global.window && global.window.muxjs) return global.window.muxjs;
+      } catch (_) {}
+    }
+    return null;
+  }
+
   function createTransmuxer(options = {}) {
-    const muxjsLib = (typeof window !== 'undefined' && window.muxjs) ? window.muxjs : (typeof muxjs !== 'undefined' ? muxjs : null);
+    const muxjsLib = getMuxJsLib();
     if (!muxjsLib || !muxjsLib.mp4 || !muxjsLib.mp4.Transmuxer) {
       throw new Error('mux.js library is not available. Ensure lib/mux.min.js is loaded.');
     }
@@ -236,8 +253,66 @@
     };
   }
 
+  /**
+   * TransmuxSession constructor for assembling TS chunks into fragmented MP4 boxes.
+   */
+  function TransmuxSession(options = {}) {
+    const muxjsLib = getMuxJsLib();
+    if (!muxjsLib || !muxjsLib.mp4 || !muxjsLib.mp4.Transmuxer) {
+      throw new Error('mux.js library is not available. Ensure lib/mux.min.js is loaded.');
+    }
+
+    const assembledBoxes = [];
+    let isInitWritten = false;
+    let totalMediaBytes = 0;
+    let initSegmentBytes = 0;
+
+    const transmuxer = new muxjsLib.mp4.Transmuxer({
+      remux: false,
+      keepOriginalTimestamps: false
+    });
+
+    try { transmuxer.setBaseMediaDecodeTime(0); } catch (_) {}
+
+    transmuxer.on('data', (segment) => {
+      if (segment.initSegment && !isInitWritten) {
+        isInitWritten = true;
+        initSegmentBytes = segment.initSegment.byteLength || segment.initSegment.length || 0;
+        assembledBoxes.push(segment.initSegment instanceof Uint8Array ? segment.initSegment : new Uint8Array(segment.initSegment));
+      }
+      if (segment.data && segment.data.byteLength > 0) {
+        totalMediaBytes += segment.data.byteLength;
+        assembledBoxes.push(segment.data instanceof Uint8Array ? segment.data : new Uint8Array(segment.data));
+      }
+    });
+
+    this.push = function (segBuffer) {
+      if (!segBuffer || segBuffer.byteLength === 0) return;
+      const uint8 = segBuffer instanceof Uint8Array ? segBuffer : new Uint8Array(segBuffer);
+      transmuxer.push(uint8);
+    };
+
+    this.flush = function () {
+      try { transmuxer.flush(); } catch (_) {}
+    };
+
+    this.getAssembledBoxes = function () {
+      try { transmuxer.flush(); } catch (_) {}
+      return assembledBoxes;
+    };
+
+    this.getTotalMediaBytes = function () {
+      return totalMediaBytes;
+    };
+
+    this.getInitSegmentBytes = function () {
+      return initSegmentBytes;
+    };
+  }
+
   return {
     createTransmuxer,
+    TransmuxSession,
     inspectAndStripTsSegment
   };
 });

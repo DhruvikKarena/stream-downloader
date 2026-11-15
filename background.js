@@ -39,6 +39,11 @@ const IGNORED_DOMAINS = [
   'hotjar.com',
   'newrelic.com',
   'sentry.io',
+  // Chrome Web Store Compliance: YouTube & GoogleVideo are strictly ignored
+  'youtube.com',
+  'googlevideo.com',
+  'youtube-nocookie.com',
+  'ytimg.com',
 ];
 
 const BADGE_COLOR = '#4CAF50';
@@ -88,57 +93,8 @@ const cachedPlaylistsByUrl = new Map();
  */
 
 // ---------------------------------------------------------------------------
-// 3. Helpers & YouTube Itag Table
+// 3. Helpers & Classification
 // ---------------------------------------------------------------------------
-
-const YOUTUBE_ITAG_INFO = {
-  // Legacy combined formats (Video + Audio)
-  '18':  { resolution: '360p', format: 'mp4', type: 'video', hasAudio: true },
-  '22':  { resolution: '720p', format: 'mp4', type: 'video', hasAudio: true },
-  '37':  { resolution: '1080p', format: 'mp4', type: 'video', hasAudio: true },
-
-  // H.264 Video Only
-  '160': { resolution: '144p', format: 'mp4', type: 'video', hasAudio: false },
-  '133': { resolution: '240p', format: 'mp4', type: 'video', hasAudio: false },
-  '134': { resolution: '360p', format: 'mp4', type: 'video', hasAudio: false },
-  '135': { resolution: '480p', format: 'mp4', type: 'video', hasAudio: false },
-  '136': { resolution: '720p', format: 'mp4', type: 'video', hasAudio: false },
-  '137': { resolution: '1080p', format: 'mp4', type: 'video', hasAudio: false },
-  '298': { resolution: '720p60', format: 'mp4', type: 'video', hasAudio: false },
-  '299': { resolution: '1080p60', format: 'mp4', type: 'video', hasAudio: false },
-
-  // VP9 Video Only
-  '278': { resolution: '144p', format: 'webm', type: 'video', hasAudio: false },
-  '242': { resolution: '240p', format: 'webm', type: 'video', hasAudio: false },
-  '243': { resolution: '360p', format: 'webm', type: 'video', hasAudio: false },
-  '244': { resolution: '480p', format: 'webm', type: 'video', hasAudio: false },
-  '247': { resolution: '720p', format: 'webm', type: 'video', hasAudio: false },
-  '248': { resolution: '1080p', format: 'webm', type: 'video', hasAudio: false },
-  '271': { resolution: '1440p', format: 'webm', type: 'video', hasAudio: false },
-  '313': { resolution: '4K', format: 'webm', type: 'video', hasAudio: false },
-  '302': { resolution: '720p60', format: 'webm', type: 'video', hasAudio: false },
-  '303': { resolution: '1080p60', format: 'webm', type: 'video', hasAudio: false },
-  '308': { resolution: '1440p60', format: 'webm', type: 'video', hasAudio: false },
-  '315': { resolution: '4K60', format: 'webm', type: 'video', hasAudio: false },
-
-  // AV1 Video Only
-  '394': { resolution: '144p', format: 'mp4', type: 'video', hasAudio: false },
-  '395': { resolution: '240p', format: 'mp4', type: 'video', hasAudio: false },
-  '396': { resolution: '360p', format: 'mp4', type: 'video', hasAudio: false },
-  '397': { resolution: '480p', format: 'mp4', type: 'video', hasAudio: false },
-  '398': { resolution: '720p', format: 'mp4', type: 'video', hasAudio: false },
-  '399': { resolution: '1080p', format: 'mp4', type: 'video', hasAudio: false },
-  '400': { resolution: '1440p', format: 'mp4', type: 'video', hasAudio: false },
-  '401': { resolution: '4K', format: 'mp4', type: 'video', hasAudio: false },
-
-  // Audio Only
-  '139': { quality: '48 kbps', format: 'm4a', type: 'audio', hasAudio: true },
-  '140': { quality: '128 kbps', format: 'm4a', type: 'audio', hasAudio: true },
-  '171': { quality: '128 kbps', format: 'webm', type: 'audio', hasAudio: true },
-  '249': { quality: '50 kbps', format: 'webm', type: 'audio', hasAudio: true },
-  '250': { quality: '70 kbps', format: 'webm', type: 'audio', hasAudio: true },
-  '251': { quality: '160 kbps', format: 'webm', type: 'audio', hasAudio: true },
-};
 
 /**
  * Derive the "clean" pathname from a URL string (strips query & fragment).
@@ -152,7 +108,7 @@ function urlPathname(urlStr) {
   }
 }
 
-/** Check if a hostname belongs to an ignored analytics/tracking domain. */
+/** Check if a hostname belongs to an ignored analytics/tracking/YouTube domain. */
 function isIgnoredDomain(urlStr) {
   try {
     const host = new URL(urlStr).hostname.toLowerCase();
@@ -163,8 +119,7 @@ function isIgnoredDomain(urlStr) {
 }
 
 /**
- * Clean a media URL (e.g. remove chunk byte-ranges from YouTube videoplayback)
- * so downloading fetches the complete file.
+ * Clean a media URL (e.g. remove chunk byte-ranges).
  */
 function cleanMediaUrl(urlStr) {
   try {
@@ -181,47 +136,14 @@ function cleanMediaUrl(urlStr) {
 
 /**
  * Classify a URL and extract rich metadata (type, format, resolution, hasAudio).
- * Inspects URL structure, query parameters (e.g. mime=video/webm), and Content-Type.
+ * Inspects URL structure, query parameters, and Content-Type.
  */
 function classifyMediaUrl(urlStr, contentType = '') {
   if (!urlStr || typeof urlStr !== 'string') return null;
   const lowerUrl = urlStr.toLowerCase();
   const ct = (contentType || '').toLowerCase();
 
-  // 1. YouTube & GoogleVideo streams (videoplayback) — inspect first so mime and itags are preserved
-  if (lowerUrl.includes('googlevideo.com/videoplayback') || lowerUrl.includes('/videoplayback')) {
-    let itag = '';
-    let mime = '';
-    try {
-      const u = new URL(urlStr);
-      itag = u.searchParams.get('itag') || '';
-      mime = (u.searchParams.get('mime') || '').toLowerCase();
-    } catch {}
-
-    const itagInfo = YOUTUBE_ITAG_INFO[itag];
-    if (itagInfo) {
-      return {
-        type: itagInfo.type,
-        resolution: itagInfo.resolution || '',
-        quality: itagInfo.quality || '',
-        format: itagInfo.format || '',
-        hasAudio: !!itagInfo.hasAudio,
-        itag
-      };
-    }
-
-    if (mime.startsWith('video/') || lowerUrl.includes('mime=video') || lowerUrl.includes('mime%2fvideo')) {
-      const isWebm = mime.includes('webm') || lowerUrl.includes('webm');
-      return { type: 'video', format: isWebm ? 'webm' : 'mp4', hasAudio: false, itag };
-    }
-    if (mime.startsWith('audio/') || lowerUrl.includes('mime=audio') || lowerUrl.includes('mime%2faudio')) {
-      const isWebm = mime.includes('webm') || lowerUrl.includes('webm');
-      return { type: 'audio', format: isWebm ? 'webm' : 'm4a', hasAudio: true, itag };
-    }
-    return { type: 'video', itag };
-  }
-
-  // 2. Content-Type inspection
+  // 1. Content-Type inspection
   if (ct.includes('mpegurl') || ct.includes('application/x-mpegurl') || ct.includes('application/vnd.apple.mpegurl')) {
     return { type: 'hls', hasAudio: true };
   }
@@ -341,25 +263,8 @@ async function addMediaItem(tabId, rawUrl, type, source = 'webRequest', size = 0
     mediaByTab.set(tabId, items);
   }
 
-  // Deduplicate by URL or YouTube stream itag
+  // Deduplicate by URL
   let existing = items.find(m => m.url === url);
-  if (!existing) {
-    try {
-      const u = new URL(url);
-      if (u.hostname.includes('googlevideo.com')) {
-        const id = u.searchParams.get('id');
-        const itag = u.searchParams.get('itag');
-        if (id && itag) {
-          existing = items.find(m => {
-            try {
-              const mu = new URL(m.url);
-              return mu.searchParams.get('id') === id && mu.searchParams.get('itag') === itag;
-            } catch { return false; }
-          });
-        }
-      }
-    } catch {}
-  }
 
   // If item already exists, update size if we discovered a larger/true size
   if (existing) {
@@ -386,16 +291,12 @@ async function addMediaItem(tabId, rawUrl, type, source = 'webRequest', size = 0
   let title = '';
   try {
     const tab = await chrome.tabs.get(tabId);
-    title = (tab.title || '').replace(/\s*-\s*YouTube$/i, '').trim();
+    title = (tab.title || '').trim();
   } catch { /* tab may have closed */ }
 
   // Construct readable filename
   let filename = extraMeta.title || filenameFromUrl(url);
-  if (url.includes('googlevideo.com/videoplayback') || url.includes('/videoplayback')) {
-    const tag = extraMeta.resolution || extraMeta.quality || (type === 'video' ? 'Video' : 'Audio');
-    const ext = extraMeta.format ? `.${extraMeta.format}` : (type === 'video' ? '.mp4' : '.m4a');
-    filename = (title ? `${title} [${tag}]` : `YouTube_${tag}`) + ext;
-  } else if (!filename || filename === 'media' || filename.startsWith('videoplayback') || !filename.includes('.')) {
+  if (!filename || filename === 'media' || !filename.includes('.')) {
     const ext = extraMeta.format ? `.${extraMeta.format}` : (type === 'audio' ? '.mp3' : '.mp4');
     filename = (title ? `${title}` : 'video_download') + ext;
   }
@@ -417,7 +318,12 @@ async function addMediaItem(tabId, rawUrl, type, source = 'webRequest', size = 0
     referer: extraMeta.referer || '',
     origin: extraMeta.origin || '',
     userAgent: extraMeta.userAgent || '',
-    pageUrl: extraMeta.pageUrl || ''
+    pageUrl: extraMeta.pageUrl || '',
+    frameId: extraMeta.frameId,
+    frameUrl: extraMeta.frameUrl || '',
+    initiator: extraMeta.initiator || '',
+    customHeaders: extraMeta.customHeaders || [],
+    meta: extraMeta
   };
 
   items.push(item);
@@ -513,8 +419,7 @@ chrome.webRequest.onSendHeaders.addListener(
                       /\.(ts|m4s)($|\?|#)/i.test(url) ||
                       lower.includes('/segment') || lower.includes('seg-');
     const isDirectVideo = /\.mp4($|\?|#)/i.test(url) || lower.includes('.mp4') ||
-                          /\.webm($|\?|#)/i.test(url) || lower.includes('.webm') ||
-                          lower.includes('videoplayback');
+                          /\.webm($|\?|#)/i.test(url) || lower.includes('.webm');
 
     if (!isM3u8 && !isMpd && !isKey && !isSegment && !isDirectVideo) return;
 
@@ -1248,26 +1153,10 @@ async function probeMediaUrl(rawUrl) {
   let mimeType = '';
   let isRangeSupported = false;
 
-  // 1. Check clen query parameter (e.g. YouTube videoplayback)
-  try {
-    const u = new URL(cleanUrl);
-    const clen = u.searchParams.get('clen');
-    if (clen && parseInt(clen, 10) > 65536) {
-      totalSize = parseInt(clen, 10);
-    }
-    const mime = u.searchParams.get('mime');
-    if (mime) mimeType = mime;
-  } catch {}
-
-  // 2. Probe using HTTP Range bytes=0-1
+  // Probe using HTTP Range bytes=0-1
   if (!totalSize) {
     try {
-      let probeUrl = cleanUrl;
-      if (probeUrl.includes('googlevideo.com') || probeUrl.includes('videoplayback')) {
-        const u = new URL(probeUrl);
-        u.searchParams.set('range', '0-1');
-        probeUrl = u.href;
-      }
+      const probeUrl = cleanUrl;
       const res = await fetch(probeUrl, {
         headers: { 'Range': 'bytes=0-1' },
         credentials: 'include'
@@ -1547,8 +1436,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     const tabIds = [chrome.tabs.TAB_ID_NONE];
-    if (message.downloaderTabId && message.downloaderTabId !== chrome.tabs.TAB_ID_NONE) {
-      tabIds.push(message.downloaderTabId);
+    const dlTabId = message.downloaderTabId || (sender && sender.tab && sender.tab.id);
+    if (dlTabId && dlTabId !== chrome.tabs.TAB_ID_NONE && !tabIds.includes(dlTabId)) {
+      tabIds.push(dlTabId);
     }
 
     if (chrome.declarativeNetRequest && requestHeaders.length > 0) {
@@ -1560,7 +1450,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const addRules = [];
       hosts.slice(0, 10).forEach((host, idx) => {
         const currentRuleId = ruleId + idx;
-        const urlFilter = host === '*' ? '*' : `||${host}/`;
+        const cleanHost = host.split(':')[0];
+        const urlFilter = cleanHost === '*' ? '*' : `||${cleanHost}`;
         addRules.push({
           id: currentRuleId,
           priority: 1,
@@ -1609,13 +1500,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (action === 'getMatchedRules') {
-    if (chrome.declarativeNetRequest && chrome.declarativeNetRequest.getMatchedRules) {
-      const tabId = message.downloaderTabId || chrome.tabs.TAB_ID_NONE;
-      chrome.declarativeNetRequest.getMatchedRules({ tabId })
-        .then(res => sendResponse({ success: true, rulesMatchedInfo: res.rulesMatchedInfo || [] }))
-        .catch(err => sendResponse({ success: false, error: err.message, rulesMatchedInfo: [] }));
-      return true;
-    }
     sendResponse({ success: true, rulesMatchedInfo: [] });
     return false;
   }
@@ -1865,48 +1749,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
     })();
     return true; // async
-  }
-
-  if (action === 'checkNativeHelper') {
-    chrome.runtime.sendNativeMessage('com.example.hlsdl', { action: 'ping' }, (response) => {
-      if (chrome.runtime.lastError) {
-        sendResponse({
-          installed: false,
-          error: chrome.runtime.lastError.message
-        });
-      } else {
-        sendResponse({
-          installed: true,
-          data: response
-        });
-      }
-    });
-    return true; // asynchronous response
-  }
-
-  if (action === 'startNativeDownload') {
-    const payload = {
-      action: 'download',
-      url: message.url || '',
-      pageUrl: message.pageUrl || '',
-      referer: message.referer || '',
-      origin: message.origin || '',
-      ua: message.ua || message.userAgent || ''
-    };
-    chrome.runtime.sendNativeMessage('com.example.hlsdl', payload, (response) => {
-      if (chrome.runtime.lastError) {
-        sendResponse({
-          success: false,
-          error: chrome.runtime.lastError.message
-        });
-      } else {
-        sendResponse({
-          success: response ? !!response.ok : false,
-          log: response ? response.log : 'No response from native helper'
-        });
-      }
-    });
-    return true; // asynchronous response
   }
 
   if (action === 'parseMPD') {

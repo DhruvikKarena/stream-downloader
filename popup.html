@@ -23,29 +23,9 @@
       </button>
     </header>
 
-    <!-- Native Helper Status Bar -->
-    <div class="helper-status-bar">
-      <div class="helper-status-info">
-        <span class="helper-dot checking" id="helper-status-dot"></span>
-        <span class="helper-status-text" id="helper-status-text">Helper: Checking...</span>
-      </div>
-      <button id="check-helper-btn" class="helper-action-btn" title="Check connection to Native Messaging Helper (yt-dlp + ffmpeg)">
-        Check helper status
-      </button>
-    </div>
-
-    <!-- Helper Installation Guide Banner (toggled via button or when DASH stream is clicked) -->
-    <div id="helper-guide-banner" class="helper-guide-banner hidden">
-      <div class="helper-guide-content">
-        <div class="helper-guide-title">⚡ Native Helper (yt-dlp + ffmpeg)</div>
-        <div class="helper-guide-desc">Enables DASH (.mpd), site extractor support & background downloads to ~/Downloads.</div>
-        <div class="helper-guide-steps">
-          <div>1. Open terminal in <code>downloader-extention/native-host</code></div>
-          <div>2. Run <code>install.bat</code> (Windows) or <code>./install_mac.sh</code> / <code>./install_linux.sh</code></div>
-          <div>3. Extension ID: <strong id="ext-id-display"></strong> <button id="copy-ext-id-btn" class="copy-pill-btn">Copy ID</button></div>
-        </div>
-      </div>
-      <button id="close-helper-guide" class="helper-close-btn" title="Close">&times;</button>
+    <!-- Policy Notice Banner (shown on YouTube) -->
+    <div id="youtube-policy-banner" class="policy-notice-banner hidden" style="background:#fff3cd; color:#856404; border:1px solid #ffeeba; padding:10px 14px; border-radius:8px; margin:8px 12px; font-size:12px; line-height:1.4;">
+      <strong>⚠️ Notice:</strong> Downloading videos from YouTube is not supported due to Google Chrome Web Store policy restrictions.
     </div>
 
     <!-- Active Video Stream Banner (Opens Downloader in New Tab) -->

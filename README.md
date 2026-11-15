@@ -1,6 +1,8 @@
 # Universal Stream & Media Downloader
 
-A powerful Manifest V3 Chrome extension designed to detect and download streaming and direct media (HLS `.m3u8`, DASH `.mpd`, direct `.mp4` / `.webm`, and audio streams) using a high-performance **Native Messaging Helper (`yt-dlp` + `ffmpeg`)** with an automatic **In-Browser HLS/AES-128 Downloader Fallback**.
+A high-performance, Manifest V3 Chrome extension designed to detect and download streaming media (HLS `.m3u8`, direct `.mp4`, `.webm`, and audio streams) directly inside the browser using multi-threaded segment caching, IndexedDB storage, Web Crypto AES-128 decryption, and client-side TS-to-MP4 transmuxing.
+
+100% self-contained and fully compliant with Google Chrome Web Store Developer Program Policies.
 
 ---
 
@@ -9,140 +11,97 @@ A powerful Manifest V3 Chrome extension designed to detect and download streamin
 ### 1. Request-Level Stream Detection
 - **`webRequest.onSendHeaders` (with `extraHeaders`)**:
   - Non-blocking observation of network traffic.
-  - Automatically identifies HLS manifests (`.m3u8`), DASH manifests (`.mpd`), and direct video files (`.mp4`, `.webm`).
-  - **Ignores individual `.ts` and `.m4s` segment requests** to prevent notification spam.
+  - Automatically identifies HLS manifests (`.m3u8`) and direct media files (`.mp4`, `.webm`).
+  - Ignores individual `.ts` and `.m4s` segment requests to prevent notification spam.
   - Captures the exact `Referer`, `Origin`, and `User-Agent` headers used by the page's video player.
   - De-duplicates streams per tab, maintains live badge counters, and purges entries on tab navigation or closure.
 
-### 2. Primary Download Path: Native Messaging Helper (`yt-dlp` + `ffmpeg`)
-- Standard 4-byte length-prefixed JSON communication with the local native host (`com.example.hlsdl`).
-- Runs `yt-dlp` with:
-  - `-N 8` (8 concurrent fragment connections).
-  - `--add-header` for the captured `Referer` and `Origin`.
-  - `--user-agent` matching the browser.
-  - `--cookies-from-browser chrome` to pass authentication cookies (with auto-retry if database is locked).
-  - Merges audio and video into `.mp4` using `ffmpeg`.
-  - Saves completed videos directly to `~/Downloads`.
-  - **Dual-target strategy**: Tries `pageUrl` first (allowing `yt-dlp`'s 1000+ specialized extractors to run), then automatically falls back to the raw stream URL.
-
-### 3. Fallback Path: In-Browser HLS Engine
-- If the Native Helper is not installed:
-  - HLS streams (`.m3u8`) download directly inside an extension tab (`downloader.html`).
-  - Concurrent worker pool (6 parallel workers by default, boostable up to 16).
+### 2. Multi-Threaded In-Browser Downloader & IndexedDB Engine
+- Runs in a dedicated background/downloader tab (`downloader.html`):
+  - Automatically parses Master playlists and sub-playlists to calculate total segment count, duration, and resolution options.
+  - Concurrent worker pool downloading segments into browser **IndexedDB** storage.
+  - Resilient against tab closures and network hiccups with exponential backoff retry.
   - Decrypts encrypted segments using **AES-128 via Web Crypto API** (AES-CBC) with playlist IV or big-endian sequence IVs.
-  - Real-time disk streaming via **File System Access API (`showSaveFilePicker`)** with fallback to in-memory Blob assembly.
-  - In-browser transmuxing of MPEG-TS to `.mp4` using locally bundled `/lib/mux.min.js` (no remote CDNs).
-  - Prompts the user to install the Native Helper for DASH (`.mpd`) and specialized site support.
+  - Strips leading fake image headers (e.g. PNG/JPEG wrappers used by obfuscated video providers) by verifying the MPEG-TS `0x47` sync byte.
 
-### 4. DRM Detection & Error Transparency
-- **Strict DRM Detection**: Automatically detects `SAMPLE-AES`, Widevine, PlayReady, FairPlay, and MPD `<ContentProtection>` tags.
-  - When DRM is detected, displays: **`🔒 DRM-protected, can't be downloaded`** and disables download actions.
-  - *No DRM circumvention is implemented.*
-- **Informative Error Messages**: If an M3U8/MPD request returns an HTML page (such as a 403 Forbidden or Cloudflare challenge) or is missing `#EXTM3U`, the extension displays the HTTP status code and the first 200 characters of the server's response.
+### 3. Client-Side Transmuxing & Export
+- Merges cached segments from IndexedDB into clean, contiguous MPEG-TS format.
+- Transmuxes TS to standard MP4 locally using bundled **FFmpeg WebAssembly** / **mux.js** without any remote server dependencies or CDNs.
+- Offers dual export options:
+  - **Save as MP4** (universal playback across mobile, desktop, and web players).
+  - **Save as TS** (raw transport stream preserving original stream packets).
+
+### 4. DRM Protection & Policy Transparency
+- **Strict DRM Detection**: Automatically detects `SAMPLE-AES`, Widevine, PlayReady, FairPlay, and encrypted media extensions.
+  - When DRM is detected, displays **`🔒 DRM-protected, can't be downloaded`** and disables download actions. No DRM circumvention is attempted or supported.
+- **YouTube Policy Compliance**: In accordance with Google Chrome Web Store Developer Program Policies, YouTube and GoogleVideo streaming domains are strictly excluded from detection and downloading.
 
 ---
 
 ## 📁 File Structure
 
 ```text
-downloader-extention/
-├── manifest.json              # Manifest V3 extension configuration (nativeMessaging, webRequest, DNR)
-├── background.js              # Service worker (onSendHeaders sniffing, badge, native messaging bridge)
-├── content.js                 # Content script (DOM video element detector & recording bridge)
+stream-downloader/
+├── manifest.json              # Manifest V3 extension configuration (compliant permissions & CSP)
+├── background.js              # Service worker (network sniffing, badge counter, tab state)
+├── content.js                 # Content script (DOM video element detector)
 ├── inject.js                  # MAIN world script (intercepts fetch, XHR, and MediaSource)
 ├── popup.html                 # Extension toolbar popup interface
-├── popup.css                  # Popup dark-themed styling & helper status indicator
-├── popup.js                   # Popup controller & download dispatcher
-├── downloader.html            # Standalone In-Browser HLS/Chunk downloader dashboard
-├── downloader.css             # Downloader UI & live segment matrix
-├── downloader.js              # Multi-threaded HLS engine (Web Crypto AES-128, mux.js remuxing)
-├── lib/
-│   └── mux.min.js             # Bundled mux.js library (no CDN dependencies)
-├── native-host/               # Native Messaging Host files
-│   ├── host.py                # Python host script (stdin/stdout 4-byte JSON protocol, runs yt-dlp)
-│   ├── host.bat               # Windows launcher wrapper
-│   ├── com.example.hlsdl.json # Native host manifest template
-│   ├── install.bat            # Windows 1-click batch installer
-│   ├── install.ps1            # Windows PowerShell installer
-│   ├── install_mac.sh         # macOS installation shell script
-│   └── install_linux.sh       # Linux installation shell script
+├── popup.css                  # Popup dark-themed styling & stream list
+├── popup.js                   # Popup controller & stream dispatcher
+├── downloader.html            # Standalone multi-threaded HLS downloader interface
+├── downloader.css             # Downloader UI & live segment progress matrix
+├── downloader.js              # Segment download pipeline, IndexedDB storage, and TS/MP4 exporter
+├── transmux.js                # In-browser transmuxer engine (FFmpeg WebAssembly & mux.js)
+├── lib/                       # Bundled offline libraries (no remote CDN scripts)
+│   ├── ffmpeg.js
+│   ├── ffmpeg-core.js
+│   ├── ffmpeg-core.wasm
+│   └── mux.min.js
 └── icons/                     # Extension icons (16px, 32px, 48px, 128px)
 ```
 
 ---
 
-## ⚙️ Installation & Setup
+## ⚙️ Installation & Usage
 
-### Step 1: Install the Chrome Extension
-1. Open Google Chrome (or Edge/Brave) and go to `chrome://extensions/`.
-2. Toggle on **Developer mode** in the top-right corner.
-3. Click **Load unpacked** and select the `downloader-extention` directory.
-4. Note your 32-character **Extension ID** displayed on the extension card (e.g., `abcdefghijklmnopqrstuvwxyz123456`).
+### Installing in Developer Mode
+1. Open Google Chrome (or Edge/Brave/Chromium) and navigate to `chrome://extensions/`.
+2. Enable **Developer mode** toggle in the top-right corner.
+3. Click **Load unpacked** and select the `stream-downloader` folder.
+4. Pin the extension to your toolbar.
 
-### Step 2: Install Prerequisites for Native Helper
-Ensure you have the following installed on your machine:
-- **Python 3** (3.8 or newer): [python.org](https://www.python.org/)
-- **yt-dlp**: [github.com/yt-dlp/yt-dlp](https://github.com/yt-dlp/yt-dlp)
-  - Windows: `winget install yt-dlp.yt-dlp` or `pip install -U yt-dlp`
-  - macOS: `brew install yt-dlp`
-  - Linux: `sudo apt install yt-dlp` or `pip install -U yt-dlp`
-- **ffmpeg**: [ffmpeg.org](https://ffmpeg.org/)
-  - Windows: `winget install Gyan.FFmpeg`
-  - macOS: `brew install ffmpeg`
-  - Linux: `sudo apt install ffmpeg`
-
-### Step 3: Register the Native Host
-Run the installer corresponding to your operating system:
-
-#### Windows
-Double-click `native-host\install.bat` (or run in PowerShell `powershell -ExecutionPolicy Bypass -File native-host\install.ps1`). When prompted, paste your Extension ID.
-
-#### macOS
-Open Terminal and run:
-```bash
-cd native-host
-chmod +x install_mac.sh
-./install_mac.sh <YOUR_EXTENSION_ID>
-```
-
-#### Linux
-Open Terminal and run:
-```bash
-cd native-host
-chmod +x install_linux.sh
-./install_linux.sh <YOUR_EXTENSION_ID>
-```
-
-### Step 4: Verify Connection
-1. Click the extension icon in Chrome.
-2. In the popup header, click **Check helper status**.
-3. The indicator will show **`Helper: Ready (yt-dlp + ffmpeg)`** with a green status light.
+### Downloading a Stream
+1. Navigate to any website playing an HLS or direct video stream.
+2. The extension badge will display the number of detected streams.
+3. Click the extension icon in the toolbar.
+4. Click **Download** next to any detected stream to open the Downloader tab.
+5. Select your desired resolution and click **Start Download**.
+6. Once download and assembly are complete, click **Save as MP4** or **Save as TS**.
 
 ---
 
-## 🔒 Permissions Explained
+## 🔒 Permissions & Security Compliance
 
-| Permission | Purpose |
+| Permission | Justification |
 | :--- | :--- |
-| `webRequest` | Non-blocking observation of network requests (`onSendHeaders` with `extraHeaders`) to capture `.m3u8`, `.mpd`, key, and segment requests and extract authentic playback headers (`Referer`, `Origin`, `User-Agent`, `Accept-Language`, custom headers). |
-| `webNavigation` | Resolves cross-origin iframe URLs (`getFrame` and `getAllFrames`) so the player's exact iframe origin and frame URL can be used as the Referer and Origin for cross-origin embedded streams (such as `surrit.com`). |
-| `declarativeNetRequest` | Creates dynamic session rules to replay captured request headers (`Referer`, `Origin`, `User-Agent`, `Accept-Language`, custom headers) scoped specifically to the extension's own requests (`tabIds: [chrome.tabs.TAB_ID_NONE]`). |
-| `declarativeNetRequestWithHostAccess` | Permits modifying request headers on host URLs without requiring static declarative rule files. |
-| `declarativeNetRequestFeedback` | Verifies whether declarativeNetRequest session rules matched and fired (`chrome.declarativeNetRequest.getMatchedRules`) for real-time diagnostic reporting. |
-| `storage` | Persists per-tab media stream lists, real request headers in `chrome.storage.session`, and user quality preferences in `chrome.storage.local`. |
-| `cookies` | Attaches authenticated site session cookies to `fetch(url, { credentials: "include" })` to prevent HTTP 403 Forbidden errors on cookie-gated streams. |
-| `scripting` | Provides the page-context fallback (`chrome.scripting.executeScript` into `world: "MAIN"`) to execute fetches directly inside the host tab when bot protection or CORS blocks extension-level requests. |
-| `tabs` & `activeTab` | Detects tab navigation and closure for automatic state cleanup, and targets the originating tab for page-context fetches. |
-| `downloads` | Saves assembled, remuxed MP4 or TS files directly to the browser's download directory. |
-| `nativeMessaging` | Allows optional communication with the local native helper (`host.py`) for command-line acceleration. |
-| `<all_urls>` | Host permission required to observe network headers, attach session cookies, and download media segments across any video streaming host. |
+| `webRequest` | Non-blocking observation of network requests (`onSendHeaders` with `extraHeaders`) to detect `.m3u8` playlists and extract player playback headers (`Referer`, `Origin`, `User-Agent`). |
+| `webNavigation` | Resolves cross-origin iframe hierarchies to preserve authentic request origins for embedded players. |
+| `declarativeNetRequest` | Replays captured playback headers (`Referer`, `Origin`, `User-Agent`) strictly for the extension's own segment download requests (`tabIds: [chrome.tabs.TAB_ID_NONE]`). |
+| `declarativeNetRequestWithHostAccess` | Allows modifying request headers for media segments across origins without static rule files. |
+| `storage` | Stores user quality preferences and per-tab media stream lists. |
+| `cookies` | Allows attaching session cookies to authenticated streaming segments. |
+| `scripting` | In-page DOM inspection fallback when streams are enclosed in sandboxed iframes. |
+| `tabs` | Manages download tab creation and tracks tab closures to clean up memory. |
+| `downloads` | Saves final converted MP4 or TS files directly to the user's Downloads directory. |
+| `<all_urls>` | Required host permission to capture stream headers and download segments across media host origins. |
 
 ---
 
-## ⚖️ Legal & Policy Notice
+## ⚖️ Policy & Legal Notice
 
-### Personal & Authorized Use Only
-This extension is intended solely for personal archival and downloading content that you own or have explicit authorization or legal rights to save. Respect the copyright and intellectual property rights of content owners.
-
-### Chrome Web Store Limitation
-Google Chrome Web Store policies strictly prohibit extensions from downloading or extracting videos from YouTube. Consequently, this extension **cannot and will not be published to the Chrome Web Store**; it is designed strictly for local, unpacked, and developer use.
+- **Personal & Authorized Archival Only**: This extension is intended solely for personal archival and downloading content that you own or have explicit authorization to save. Respect the copyright and intellectual property rights of content owners.
+- **Chrome Web Store Policy Compliance**: This extension strictly complies with Google Chrome Web Store policies:
+  - Downloading from YouTube or GoogleVideo is strictly blocked and not supported.
+  - No remote scripts, eval(), or external executable downloads.
+  - Zero bypass of DRM or technical access controls.

@@ -8,13 +8,12 @@
     "webNavigation",
     "declarativeNetRequest",
     "declarativeNetRequestWithHostAccess",
-    "declarativeNetRequestFeedback",
     "storage",
     "cookies",
     "scripting",
     "tabs",
-    "downloads",
-    "nativeMessaging"
+    "activeTab",
+    "downloads"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -37,6 +36,11 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
+      "exclude_matches": [
+        "*://*.youtube.com/*",
+        "*://*.youtube-nocookie.com/*",
+        "*://*.googlevideo.com/*"
+      ],
       "js": ["content.js"],
       "run_at": "document_start",
       "all_frames": true,
@@ -44,6 +48,11 @@
     },
     {
       "matches": ["<all_urls>"],
+      "exclude_matches": [
+        "*://*.youtube.com/*",
+        "*://*.youtube-nocookie.com/*",
+        "*://*.googlevideo.com/*"
+      ],
       "js": ["inject.js"],
       "run_at": "document_start",
       "all_frames": true,

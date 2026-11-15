@@ -400,7 +400,7 @@
         const isMp4 = mimeType.includes('mp4');
         const finalBlob = new Blob(recordedBlobs, { type: mimeType });
         const rawTitle = toCleanString(document.title) || 'video_recording';
-        const cleanTitle = rawTitle.replace(/[\\/:*?"<>|]/g, '_').replace(/\s*-\s*YouTube$/i, '').trim();
+        const cleanTitle = rawTitle.replace(/[\\/:*?"<>|]/g, '_').trim();
         const filename = `${cleanTitle || 'video'}.${isMp4 ? 'mp4' : 'webm'}`;
 
         const a = document.createElement('a');
